@@ -1,6 +1,8 @@
-import re
-import json
+import csv
 import io
+import json
+import os
+import re
 import base64
 
 import pandas as pd
@@ -108,7 +110,6 @@ def parse_llm_json(raw):
 
 def ensure_csv(path, fieldnames):
     """Create *path* with a header row if it does not already exist."""
-    import os, csv
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
