@@ -5,12 +5,21 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 import json
-import re
-import base64
-import io
-import time 
+import time
 import csv
-from rapidfuzz import fuzz, process
+
+from utils import (
+    normalize_text,
+    normalize_name,
+    normalize_date,
+    fuzzy_match_name,
+    extract_postcode,
+    remove_postcode,
+    image_to_base64,
+    parse_llm_json,
+    ensure_csv,
+    is_missing,
+)
 
 load_dotenv(dotenv_path="credentials")
 
@@ -24,50 +33,9 @@ FIELDNAMES = ["filename", "name", "address", "date_of_birth", "occupation", "emp
 
 files = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".png") and not f.startswith("._")]
 results = []
+
+
 def comparison():
-    def normalize_text(value):
-        if pd.isna(value):
-            return value
-        value = str(value).lower().strip()
-        value = re.sub(r'\b(mr|mrs|ms|miss|dr|prof|account holder)\b\.?:?', '', value)
-        value = re.sub(r'\s+', ' ', value).strip()
-        return value
-
-    def normalize_name(value):
-        if pd.isna(value):
-            return value
-        value = str(value).lower().strip()
-        value = re.sub(r'\b(mr|mrs|ms|miss|dr|prof|account holder)\b\.?:?', '', value)
-        value = re.sub(r'\s+', ' ', value).strip()
-
-        parts = value.split()
-        if len(parts) > 2:
-            value = f"{parts[0]} {parts[-1]}"
-
-        return value
-
-    def normalize_date(value):
-        if pd.isna(value):
-            return None
-        value = str(value).strip()
-        # try common formats and convert to YYYY-MM-DD
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return pd.to_datetime(value, format=fmt).strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                continue
-        return None
-
-
-    def fuzzy_match_name(name, choices, threshold=85):
-        if pd.isna(name) or not choices:
-            return None
-        match = process.extractOne(name, choices, scorer=fuzz.token_sort_ratio)
-        if match and match[1] >= threshold:
-            return match[0]
-        return None
-
-
     def compare_csvs(submit_path="submit.csv", truth_path="customer_table.csv"):
         submit_df = pd.read_csv(submit_path)
         truth_df = pd.read_csv(truth_path)
@@ -118,26 +86,24 @@ def comparison():
                 submit_val = row.get(f"{field}_submit")
                 truth_val = row.get(f"{field}_truth")
 
-                submit_missing = pd.isna(submit_val) or submit_val == ""
-                truth_missing = pd.isna(truth_val) or truth_val == ""
-
-                if field == "employer" and submit_missing:
+                if field == "employer" and is_missing(submit_val):
                     continue
 
-                if submit_missing and truth_missing:
+                if is_missing(submit_val) and is_missing(truth_val):
                     continue
 
                 if submit_val == truth_val:
                     continue
 
                 results.append({
-                "filename": row.get("filename"),
-                "name": row.get("name"),
-                "date_of_birth": row.get("date_of_birth"),
-                "category": "N/A",
-                "field": "name",
-                "submit_value": row.get("name"),
-                "truth_value": "No matching name found"})
+                    "filename": row.get("filename"),
+                    "name": row.get("name"),
+                    "date_of_birth": row.get("date_of_birth"),
+                    "category": "N/A",
+                    "field": "name",
+                    "submit_value": row.get("name"),
+                    "truth_value": "No matching name found",
+                })
 
         for _, row in unmatched.iterrows():
             results.append({
@@ -147,18 +113,17 @@ def comparison():
                 "category": "N/A",
                 "field": "name",
                 "submit_value": row.get("name"),
-                "truth_value": "No matching name found"})
-
-          
+                "truth_value": "No matching name found",
+            })
 
         return pd.DataFrame(results)
-
 
     mismatches_df = compare_csvs()
     mismatches_df["sort_key"] = mismatches_df["category"].apply(lambda x: 999 if x == "N/A" else x)
     mismatches_df = mismatches_df.sort_values(by=["sort_key", "name"]).drop(columns="sort_key").reset_index(drop=True)
     print(mismatches_df)
     mismatches_df.to_csv("mismatches.csv", index=False)
+
 
 def correct_rotation(filepath):
     image = Image.open(filepath)
@@ -172,7 +137,7 @@ def correct_rotation(filepath):
         osd_data = pytesseract.image_to_osd(boosted, output_type='dict')
         rotation_angle = osd_data['rotate']
         if rotation_angle != 0:
-            print(f"Correcting rotation: {rotation_angle}°")
+            print(f"Correcting rotation: {rotation_angle}\u00b0")
             image = image.rotate(rotation_angle, expand=True)
         else:
             print("No rotation needed")
@@ -181,10 +146,6 @@ def correct_rotation(filepath):
 
     return image
 
-def image_to_base64(image):
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 def extract_info(image):
     img_b64 = image_to_base64(image)
@@ -192,50 +153,29 @@ def extract_info(image):
     response = mistral_client.chat.complete(
         model="pixtral-large-latest",
         messages=[
-            {"role": "user","content": [ 
-                    {"type": "text","text": 
-                            (
-                         "Extract the following fields from this document image and return ONLY valid JSON, "
-                        "no markdown formatting, no explanation: "
-                        "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
-                        "occupation(often seen with job in front, DO NOT include the word 'Job'), "
-                        "employer(for bank statements and utility bills do not include employer). "
-                        "Read names and addresses carefully and exactly as written. "
-                        "Text with no meaning associated with the fields specified should be ignored. "
-                        "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
-                        "Set any missing fields to null."
-                            ), 
-                        },
-                    {"type": "image_url","image_url": f"data:image/png;base64,{img_b64}",},
-                ],
-            }
+            {"role": "user", "content": [
+                {"type": "text", "text": (
+                    "Extract the following fields from this document image and return ONLY valid JSON, "
+                    "no markdown formatting, no explanation: "
+                    "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
+                    "occupation(often seen with job in front, DO NOT include the word 'Job'), "
+                    "employer(for bank statements and utility bills do not include employer). "
+                    "Read names and addresses carefully and exactly as written. "
+                    "Text with no meaning associated with the fields specified should be ignored. "
+                    "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
+                    "Set any missing fields to null."
+                )},
+                {"type": "image_url", "image_url": f"data:image/png;base64,{img_b64}"},
+            ]}
         ],
     )
 
-    raw = response.choices[0].message.content
-    clean = raw.replace("```json", "").replace("```", "").strip()
+    return parse_llm_json(response.choices[0].message.content)
 
-    if not clean:
-        print("WARNING: empty response")
-        return None
-
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        print("WARNING: could not parse JSON")
-        print(f"Raw response: {raw}")
-        return None
-    
-with open("submit.csv", "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-    writer.writeheader()
 
 def store():
-    if not os.path.exists("submit.csv"):
-        with open("submit.csv", "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-            writer.writeheader()
-            
+    ensure_csv("submit.csv", FIELDNAMES)
+
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
         print(f"\n--- Processing: {filename} ---")
@@ -250,29 +190,17 @@ def store():
                 writer.writerow(data)
 
         time.sleep(10)
-        
+
     df = pd.DataFrame(results)
 
     def add_postcode_column(df):
-        postcode_pattern = r'([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})'
-
-        def extract_postcode(address):
-            if pd.isna(address):
-                return None
-            match = re.search(postcode_pattern, address)
-            return match.group(1) if match else None
-
-        def remove_postcode(address):
-            if pd.isna(address):
-                return address
-            return re.sub(postcode_pattern, '', address).rstrip(', ').strip()
-
         df['postcode'] = df['address'].apply(extract_postcode)
         df['address'] = df['address'].apply(remove_postcode)
-
         df.to_csv("final_submit.csv", index=False)
 
     add_postcode_column(df)
 
+
 store()
 comparison()
+print("hello")
