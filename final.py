@@ -140,6 +140,8 @@ def comparison():
     print_accuracy_report(total_fields, total_mismatches, accuracy)
 
 
+from PIL import ImageEnhance
+
 def correct_rotation(filepath):
     image = Image.open(filepath)
 
@@ -152,15 +154,26 @@ def correct_rotation(filepath):
         osd_data = pytesseract.image_to_osd(boosted, output_type='dict')
         rotation_angle = osd_data['rotate']
         if rotation_angle != 0:
-            print(f"Correcting rotation: {rotation_angle}\u00b0")
+            print(f"Correcting rotation: {rotation_angle}°")
             image = image.rotate(rotation_angle, expand=True)
         else:
             print("No rotation needed")
     except pytesseract.TesseractError as e:
         print(f"OSD still failed: {e}")
 
-    return image
+    # greyscale conversion
+    #image = image.convert('L')
+    #image = image.convert('RGB')  # convert back so PNG encoding works correctly
 
+    # contrast boost
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)
+
+    # sharpness boost
+    sharpener = ImageEnhance.Sharpness(image)
+    image = sharpener.enhance(2.0)
+
+    return image
 
 def extract_info(image):
     img_b64 = image_to_base64(image)
@@ -170,15 +183,32 @@ def extract_info(image):
         messages=[
             {"role": "user", "content": [
                 {"type": "text", "text": (
-                    "Extract the following fields from this document image and return ONLY valid JSON, "
-                    "no markdown formatting, no explanation: "
-                    "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
-                    "occupation(often seen with job in front, DO NOT include the word 'Job'), "
-                    "employer(for bank statements and utility bills do not include employer). "
-                    "Read names and addresses carefully and exactly as written. "
-                    "Text with no meaning associated with the fields specified should be ignored. "
-                    "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
-                    "Set any missing fields to null."
+                  "You are a document data extraction assistant. Extract the following fields from the document image and return ONLY a valid JSON object. No markdown, no explanation, no extra text — just the raw JSON.\n\n"
+
+                    "Fields to extract:\n"
+                    "- name: Full name of the individual. Read carefully and extract exactly as written.\n"
+                    "- address: Full address including street, city, and postcode. Read carefully and extract exactly as written.\n"
+                    "- date_of_birth: Found near 'DoB', 'Date of Birth', or similar labels. Format MUST be YYYY-MM-DD. This field is present in every document — search the entire document carefully before concluding it is missing.\n"
+                    "- occupation: The person's job title. Often preceded by the word 'Job', 'Occupation', or similar. Do NOT include the word 'Job' in your output.\n"
+                    "- employer: The name of the employing organisation. ONLY extract this from payslip documents. For bank statements and utility bills, set this field to null.\n\n"
+
+                    "Document hints:\n"
+                    "- Documents may be identified by prefixes such as BST (bank statement), PAY (payslip), or UTIL-**** (utility bill).\n"
+                    "- If the document is a PAY document, carefully search for the employer name, even if it is not immediately adjacent to the employee details.\n"
+                    "- If the document is a BST or UTIL document, employer should be null.\n"
+                    "- Names may appear in headers, account holder sections, employee sections, customer sections, or recipient sections.\n"
+                    "- Addresses may span multiple lines and should be combined into a single value, preserving all address information including the postcode.\n"
+                    "- Date of birth may appear in personal information sections alongside the name or address, and may use abbreviations such as 'DoB'. Search the entire document before deciding it is missing.\n"
+                    "- Occupation may appear within employment details, personal details, applicant information, or customer information.\n\n"
+
+                    "Rules:\n"
+                    "- If a field cannot be found after searching the entire document, set it to null.\n"
+                    "- Do NOT infer, guess, or generate values that are not explicitly present in the document.\n"
+                    "- Do NOT include the word 'Payslip' in the employer field.\n"
+                    "- Do NOT include any text that does not directly correspond to one of the fields above.\n"
+                    "- Names and addresses must be extracted exactly as they appear — do not correct spelling, punctuation, abbreviations, or formatting.\n"
+                    "- Preserve all address components, including street, city, county (if present), and postcode.\n"
+                    "- Return exactly one valid JSON object containing only the keys: name, address, date_of_birth, occupation, employer.\n"
                 )},
                 {"type": "image_url", "image_url": f"data:image/png;base64,{img_b64}"},
             ]}
@@ -189,7 +219,9 @@ def extract_info(image):
 
 
 def store():
-    ensure_csv("submit.csv", FIELDNAMES)
+    with open("submit.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
 
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
