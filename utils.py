@@ -106,6 +106,24 @@ def parse_llm_json(raw):
         return None
 
 
+# ── Accuracy helpers ───────────────────────────────────────────────────────────
+
+def calculate_accuracy(total_fields, total_mismatches):
+    """Return accuracy percentage given total fields compared and mismatches."""
+    if total_fields > 0:
+        return (total_fields - total_mismatches) / total_fields * 100
+    return 0.0
+
+
+def print_accuracy_report(total_fields, total_mismatches, accuracy):
+    """Print a formatted accuracy report to stdout."""
+    print(f"\n--- Accuracy Report ---")
+    print(f"Total fields compared: {total_fields}")
+    print(f"Mismatches found:      {total_mismatches}")
+    print(f"Matches:               {total_fields - total_mismatches}")
+    print(f"Accuracy:              {accuracy:.2f}%")
+
+
 # ── CSV helpers ────────────────────────────────────────────────────────────────
 
 def ensure_csv(path, fieldnames):
