@@ -154,8 +154,41 @@ def correct_rotation(filepath):
         osd_data = pytesseract.image_to_osd(boosted, output_type='dict')
         rotation_angle = osd_data['rotate']
         if rotation_angle != 0:
-            print(f"Correcting rotation: {rotation_angle}°")
-            image = image.rotate(rotation_angle, expand=True)
+            # If 270° detected, try 90° instead and recheck
+            if rotation_angle in (90, 270):
+                rotated_90 = image.rotate(90, expand=True)
+                rotated_270 = image.rotate(270, expand=True)
+
+                # Recheck both rotations to see which produces 0° OSD
+                try:
+                    boosted_90 = rotated_90.resize(
+                        (rotated_90.width * 2, rotated_90.height * 2), Image.LANCZOS
+                    )
+                    recheck_90 = pytesseract.image_to_osd(boosted_90, output_type='dict')['rotate']
+                except pytesseract.TesseractError:
+                    recheck_90 = 999
+
+                try:
+                    boosted_270 = rotated_270.resize(
+                        (rotated_270.width * 2, rotated_270.height * 2), Image.LANCZOS
+                    )
+                    recheck_270 = pytesseract.image_to_osd(boosted_270, output_type='dict')['rotate']
+                except pytesseract.TesseractError:
+                    recheck_270 = 999
+
+                if recheck_90 == 0:
+                    print(f"Detected {rotation_angle}°, verified 90° rotation is correct")
+                    image = rotated_90
+                elif recheck_270 == 0:
+                    print(f"Detected {rotation_angle}°, verified 270° rotation is correct")
+                    image = rotated_270
+                else:
+                    # Fallback: use the originally detected angle
+                    print(f"Recheck inconclusive, applying detected {rotation_angle}°")
+                    image = image.rotate(rotation_angle, expand=True)
+            else:
+                print(f"Correcting rotation: {rotation_angle}°")
+                image = image.rotate(rotation_angle, expand=True)
         else:
             print("No rotation needed")
     except pytesseract.TesseractError as e:
