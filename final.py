@@ -80,6 +80,8 @@ def comparison():
         }
 
         results = []
+        total_fields_checked = 0
+        total_mismatches = 0
 
         for _, row in merged.iterrows():
             for field, category in fields_to_check.items():
@@ -92,9 +94,12 @@ def comparison():
                 if is_missing(submit_val) and is_missing(truth_val):
                     continue
 
+                total_fields_checked += 1
+
                 if submit_val == truth_val:
                     continue
 
+                total_mismatches += 1
                 results.append({
                     "filename": row.get("filename"),
                     "name": row.get("name"),
@@ -104,6 +109,10 @@ def comparison():
                     "submit_value": row.get("name"),
                     "truth_value": "No matching name found",
                 })
+
+        # Count unmatched records (each counts as a mismatch on the name field)
+        total_fields_checked += len(unmatched)
+        total_mismatches += len(unmatched)
 
         for _, row in unmatched.iterrows():
             results.append({
@@ -116,13 +125,24 @@ def comparison():
                 "truth_value": "No matching name found",
             })
 
-        return pd.DataFrame(results)
+        if total_fields_checked > 0:
+            accuracy = (total_fields_checked - total_mismatches) / total_fields_checked * 100
+        else:
+            accuracy = 0.0
 
-    mismatches_df = compare_csvs()
+        return pd.DataFrame(results), total_fields_checked, total_mismatches, accuracy
+
+    mismatches_df, total_fields, total_mismatches, accuracy = compare_csvs()
     mismatches_df["sort_key"] = mismatches_df["category"].apply(lambda x: 999 if x == "N/A" else x)
     mismatches_df = mismatches_df.sort_values(by=["sort_key", "name"]).drop(columns="sort_key").reset_index(drop=True)
     print(mismatches_df)
     mismatches_df.to_csv("mismatches.csv", index=False)
+
+    print(f"\n--- Accuracy Report ---")
+    print(f"Total fields compared: {total_fields}")
+    print(f"Mismatches found:      {total_mismatches}")
+    print(f"Matches:               {total_fields - total_mismatches}")
+    print(f"Accuracy:              {accuracy:.2f}%")
 
 
 def correct_rotation(filepath):
