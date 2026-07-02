@@ -19,6 +19,8 @@ from utils import (
     parse_llm_json,
     ensure_csv,
     is_missing,
+    calculate_accuracy,
+    print_accuracy_report,
 )
 
 load_dotenv(dotenv_path="credentials")
@@ -125,10 +127,7 @@ def comparison():
                 "truth_value": "No matching name found",
             })
 
-        if total_fields_checked > 0:
-            accuracy = (total_fields_checked - total_mismatches) / total_fields_checked * 100
-        else:
-            accuracy = 0.0
+        accuracy = calculate_accuracy(total_fields_checked, total_mismatches)
 
         return pd.DataFrame(results), total_fields_checked, total_mismatches, accuracy
 
@@ -138,11 +137,7 @@ def comparison():
     print(mismatches_df)
     mismatches_df.to_csv("mismatches.csv", index=False)
 
-    print(f"\n--- Accuracy Report ---")
-    print(f"Total fields compared: {total_fields}")
-    print(f"Mismatches found:      {total_mismatches}")
-    print(f"Matches:               {total_fields - total_mismatches}")
-    print(f"Accuracy:              {accuracy:.2f}%")
+    print_accuracy_report(total_fields, total_mismatches, accuracy)
 
 
 def correct_rotation(filepath):
@@ -202,6 +197,7 @@ def store():
         image = correct_rotation(filepath)
         data = extract_info(image)
         if data is not None:
+            data["filename"] = filename
             results.append(data)
             print(json.dumps(data, indent=2))
 
