@@ -99,22 +99,17 @@ def comparison():
                     "filename": row.get("filename"),
                     "name": row.get("name"),
                     "date_of_birth": row.get("date_of_birth"),
-                    "category": "N/A",
-                    "field": "name",
-                    "submit_value": row.get("name"),
-                    "truth_value": "No matching name found",
+                    "category": category,
+                    "field": field,
+                    "submit_value": submit_val,
+                    "truth_value": truth_val,
                 })
 
-        for _, row in unmatched.iterrows():
-            results.append({
-                "filename": row.get("filename"),
-                "name": row.get("name"),
-                "date_of_birth": row.get("date_of_birth"),
-                "category": "N/A",
-                "field": "name",
-                "submit_value": row.get("name"),
-                "truth_value": "No matching name found",
-            })
+        # Report unmatched names separately (not in customer table)
+        if len(unmatched) > 0:
+            print(f"\n--- Not in Customer Table ({len(unmatched)} records) ---")
+            for _, row in unmatched.iterrows():
+                print(f"  {row.get('filename')}: {row.get('name')}")
 
         return pd.DataFrame(results)
 
