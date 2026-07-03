@@ -24,6 +24,9 @@ from utils import (
     extract_customer_id,
     extract_document_type,
     calculate_accuracy,
+    load_customer_lookup,
+    semantic_correct_name,
+    cross_validate_date,
 )
 
 load_dotenv(dotenv_path="credentials")
@@ -269,24 +272,44 @@ def correct_rotation(filepath):
     return image
 
 
-def extract_info(image):
+def ocr_preread(image):
+    """Run OCR on the image to get raw text for cross-validation."""
+    try:
+        text = pytesseract.image_to_string(image)
+        return text.strip()
+    except pytesseract.TesseractError:
+        return ""
+
+
+def extract_info(image, ocr_text=""):
     img_b64 = image_to_base64(image)
+
+    # Build prompt with OCR context for cross-validation
+    prompt = (
+        "Extract the following fields from this document image and return ONLY valid JSON, "
+        "no markdown formatting, no explanation: "
+        "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
+        "occupation(often seen with job in front, DO NOT include the word 'Job'), "
+        "employer(for bank statements and utility bills do not include employer). "
+        "Read names and addresses carefully and exactly as written. "
+        "Text with no meaning associated with the fields specified should be ignored. "
+        "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
+        "Set any missing fields to null."
+    )
+
+    if ocr_text:
+        prompt += (
+            "\n\nFor cross-reference, here is the raw OCR text extracted from this document. "
+            "Use it to double-check your reading of names, dates, and addresses — "
+            "if the image is unclear, prefer the OCR text for spelling:\n\n"
+            f"{ocr_text[:3000]}"
+        )
 
     response = mistral_client.chat.complete(
         model="pixtral-large-latest",
         messages=[
             {"role": "user", "content": [
-                {"type": "text", "text": (
-                    "Extract the following fields from this document image and return ONLY valid JSON, "
-                    "no markdown formatting, no explanation: "
-                    "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
-                    "occupation(often seen with job in front, DO NOT include the word 'Job'), "
-                    "employer(for bank statements and utility bills do not include employer). "
-                    "Read names and addresses carefully and exactly as written. "
-                    "Text with no meaning associated with the fields specified should be ignored. "
-                    "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
-                    "Set any missing fields to null."
-                )},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": f"data:image/png;base64,{img_b64}"},
             ]}
         ],
@@ -298,13 +321,37 @@ def extract_info(image):
 def store():
     ensure_csv("submit.csv", FIELDNAMES)
 
+    # Load customer table for semantic correction
+    id_lookup, all_names = load_customer_lookup("customer_table.csv")
+
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
         print(f"\n--- Processing: {filename} ---")
         image = correct_rotation(filepath)
-        data = extract_info(image)
+
+        # OCR pre-read for cross-validation
+        ocr_text = ocr_preread(image)
+        if ocr_text:
+            print(f"  OCR pre-read: {len(ocr_text)} characters extracted")
+
+        data = extract_info(image, ocr_text)
         if data is not None:
             data["filename"] = filename
+
+            # Semantic name correction
+            corrected_name, name_was_corrected = semantic_correct_name(
+                data.get("name"), filename, id_lookup, all_names
+            )
+            if name_was_corrected:
+                data["name"] = corrected_name
+
+            # Date cross-validation
+            corrected_dob, dob_was_corrected = cross_validate_date(
+                data.get("date_of_birth"), ocr_text, filename, id_lookup
+            )
+            if dob_was_corrected:
+                data["date_of_birth"] = corrected_dob
+
             results.append(data)
             print(json.dumps(data, indent=2))
 
