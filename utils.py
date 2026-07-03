@@ -60,13 +60,28 @@ def normalize_date(value):
 
 # ── Fuzzy matching ─────────────────────────────────────────────────────────────
 
-def fuzzy_match_name(name, choices, threshold=85):
+def fuzzy_match_name(name, choices, threshold=70):
     if pd.isna(name) or not choices:
         return None
     match = process.extractOne(name, choices, scorer=fuzz.token_sort_ratio)
     if match and match[1] >= threshold:
         return match[0]
     return None
+
+
+def normalize_postcode(address):
+    """Normalize postcode within an address by removing spaces and lowering."""
+    if pd.isna(address):
+        return address
+    address = str(address)
+    # Replace pipe separators with commas for consistent formatting
+    address = address.replace(' | ', ', ').replace('| ', ', ').replace(' |', ', ').replace('|', ', ')
+    # Normalize postcode spacing: find postcode and remove internal spaces
+    def _strip_postcode_space(m):
+        return m.group(0).replace(' ', '').lower()
+    address = re.sub(r'[A-Za-z]{1,2}\d{1,2}[A-Za-z]?\s?\d[A-Za-z]{2}', _strip_postcode_space, address)
+    address = re.sub(r'\s+', ' ', address).strip()
+    return address
 
 
 # ── Postcode helpers ───────────────────────────────────────────────────────────
