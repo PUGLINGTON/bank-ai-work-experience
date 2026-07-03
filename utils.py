@@ -115,13 +115,18 @@ def calculate_accuracy(total_fields, total_mismatches):
     return 0.0
 
 
-def print_accuracy_report(total_fields, total_mismatches, accuracy):
-    """Print a formatted accuracy report to stdout."""
+def print_accuracy_report(total_fields, total_mismatches, accuracy, per_field_accuracy=None):
+    """Print a formatted accuracy report to stdout, with optional per-field breakdown."""
     print(f"\n--- Accuracy Report ---")
     print(f"Total fields compared: {total_fields}")
     print(f"Mismatches found:      {total_mismatches}")
     print(f"Matches:               {total_fields - total_mismatches}")
-    print(f"Accuracy:              {accuracy:.2f}%")
+    print(f"Overall accuracy:      {accuracy:.2f}%")
+
+    if per_field_accuracy:
+        print(f"\n--- Per-Field Accuracy ---")
+        for field, field_accuracy in per_field_accuracy.items():
+            print(f"  {field:<15} {field_accuracy:.2f}%")
 
 
 # ── CSV helpers ────────────────────────────────────────────────────────────────

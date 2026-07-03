@@ -9,19 +9,12 @@ import time
 import csv
 
 from utils import (
-    normalize_text,
-    normalize_name,
-    normalize_date,
-    fuzzy_match_name,
     extract_postcode,
     remove_postcode,
     image_to_base64,
     parse_llm_json,
-    ensure_csv,
-    is_missing,
-    calculate_accuracy,
-    print_accuracy_report,
 )
+from comparison import run_comparison, clean_employer
 
 load_dotenv(dotenv_path="credentials")
 
@@ -35,109 +28,6 @@ FIELDNAMES = ["filename", "name", "address", "date_of_birth", "occupation", "emp
 
 files = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".png") and not f.startswith("._")]
 results = []
-
-
-def comparison():
-    def compare_csvs(submit_path="submit.csv", truth_path="customer_table.csv"):
-        submit_df = pd.read_csv(submit_path)
-        truth_df = pd.read_csv(truth_path)
-
-        text_columns = ["address", "occupation", "employer"]
-
-        for col in text_columns:
-            if col in submit_df.columns:
-                submit_df[col] = submit_df[col].apply(normalize_text)
-            if col in truth_df.columns:
-                truth_df[col] = truth_df[col].apply(normalize_text)
-
-        submit_df["name"] = submit_df["name"].apply(normalize_name)
-        truth_df["name"] = truth_df["name"].apply(normalize_name)
-
-        submit_df["date_of_birth"] = submit_df["date_of_birth"].apply(normalize_date)
-        truth_df["date_of_birth"] = truth_df["date_of_birth"].apply(normalize_date)
-
-        truth_names = truth_df["name"].dropna().unique().tolist()
-
-        submit_df["matched_name"] = submit_df["name"].apply(
-            lambda n: fuzzy_match_name(n, truth_names)
-        )
-
-        unmatched = submit_df[submit_df["matched_name"].isna()]
-        matched = submit_df.dropna(subset=["matched_name"])
-
-        merged = matched.merge(
-            truth_df,
-            left_on="matched_name",
-            right_on="name",
-            suffixes=("_submit", "_truth"),
-            how="inner"
-        )
-
-        fields_to_check = {
-            "name": 1,
-            "date_of_birth": 1,
-            "address": 2,
-            "occupation": 2,
-            "employer": 3,
-        }
-
-        results = []
-        total_fields_checked = 0
-        total_mismatches = 0
-
-        for _, row in merged.iterrows():
-            for field, category in fields_to_check.items():
-                submit_val = row.get(f"{field}_submit")
-                truth_val = row.get(f"{field}_truth")
-
-                if field == "employer" and is_missing(submit_val):
-                    continue
-
-                if is_missing(submit_val) and is_missing(truth_val):
-                    continue
-
-                total_fields_checked += 1
-
-                if submit_val == truth_val:
-                    continue
-
-                total_mismatches += 1
-                results.append({
-                    "filename": row.get("filename"),
-                    "name": row.get("name"),
-                    "date_of_birth": row.get("date_of_birth"),
-                    "category": "N/A",
-                    "field": "name",
-                    "submit_value": row.get("name"),
-                    "truth_value": "No matching name found",
-                })
-
-        # Count unmatched records (each counts as a mismatch on the name field)
-        total_fields_checked += len(unmatched)
-        total_mismatches += len(unmatched)
-
-        for _, row in unmatched.iterrows():
-            results.append({
-                "filename": row.get("filename"),
-                "name": row.get("name"),
-                "date_of_birth": row.get("date_of_birth"),
-                "category": "N/A",
-                "field": "name",
-                "submit_value": row.get("name"),
-                "truth_value": "No matching name found",
-            })
-
-        accuracy = calculate_accuracy(total_fields_checked, total_mismatches)
-
-        return pd.DataFrame(results), total_fields_checked, total_mismatches, accuracy
-
-    mismatches_df, total_fields, total_mismatches, accuracy = compare_csvs()
-    mismatches_df["sort_key"] = mismatches_df["category"].apply(lambda x: 999 if x == "N/A" else x)
-    mismatches_df = mismatches_df.sort_values(by=["sort_key", "name"]).drop(columns="sort_key").reset_index(drop=True)
-    print(mismatches_df)
-    mismatches_df.to_csv("mismatches.csv", index=False)
-
-    print_accuracy_report(total_fields, total_mismatches, accuracy)
 
 
 from PIL import ImageEnhance
@@ -154,8 +44,41 @@ def correct_rotation(filepath):
         osd_data = pytesseract.image_to_osd(boosted, output_type='dict')
         rotation_angle = osd_data['rotate']
         if rotation_angle != 0:
-            print(f"Correcting rotation: {rotation_angle}°")
-            image = image.rotate(rotation_angle, expand=True)
+            # If 90° or 270° detected, try both and recheck to pick the correct one
+            if rotation_angle in (90, 270):
+                rotated_90 = image.rotate(90, expand=True)
+                rotated_270 = image.rotate(270, expand=True)
+
+                # Recheck both rotations to see which produces 0° OSD
+                try:
+                    boosted_90 = rotated_90.resize(
+                        (rotated_90.width * 2, rotated_90.height * 2), Image.LANCZOS
+                    )
+                    recheck_90 = pytesseract.image_to_osd(boosted_90, output_type='dict')['rotate']
+                except pytesseract.TesseractError:
+                    recheck_90 = 999
+
+                try:
+                    boosted_270 = rotated_270.resize(
+                        (rotated_270.width * 2, rotated_270.height * 2), Image.LANCZOS
+                    )
+                    recheck_270 = pytesseract.image_to_osd(boosted_270, output_type='dict')['rotate']
+                except pytesseract.TesseractError:
+                    recheck_270 = 999
+
+                if recheck_90 == 0:
+                    print(f"Detected {rotation_angle}°, verified 90° rotation is correct")
+                    image = rotated_90
+                elif recheck_270 == 0:
+                    print(f"Detected {rotation_angle}°, verified 270° rotation is correct")
+                    image = rotated_270
+                else:
+                    # Fallback: use the originally detected angle
+                    print(f"Recheck inconclusive, applying detected {rotation_angle}°")
+                    image = image.rotate(rotation_angle, expand=True)
+            else:
+                print(f"Correcting rotation: {rotation_angle}°")
+                image = image.rotate(rotation_angle, expand=True)
         else:
             print("No rotation needed")
     except pytesseract.TesseractError as e:
@@ -241,14 +164,14 @@ def store():
 
     df = pd.DataFrame(results)
 
-    def add_postcode_column(df):
-        df['postcode'] = df['address'].apply(extract_postcode)
-        df['address'] = df['address'].apply(remove_postcode)
-        df.to_csv("final_submit.csv", index=False)
+    # Strip "PAYSLIP" from employer field
+    if "employer" in df.columns:
+        df["employer"] = df["employer"].apply(clean_employer)
 
-    add_postcode_column(df)
+    df['postcode'] = df['address'].apply(extract_postcode)
+    df['address'] = df['address'].apply(remove_postcode)
+    df.to_csv("final_submit.csv", index=False)
 
 
 store()
-comparison()
-print("hello")
+run_comparison()
