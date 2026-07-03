@@ -100,13 +100,6 @@ def extract_document_type(filename):
     return 'Unknown'
 
 
-def calculate_accuracy(total_fields, total_mismatches):
-    """Return accuracy percentage given total fields compared and mismatches."""
-    if total_fields > 0:
-        return (total_fields - total_mismatches) / total_fields * 100
-    return 0.0
-
-
 def fuzzy_match_name(name, choices, threshold=70):
     if pd.isna(name) or not choices:
         return None
@@ -151,6 +144,29 @@ def parse_llm_json(raw):
         print("WARNING: could not parse JSON")
         print(f"Raw response: {raw}")
         return None
+
+
+# ── Accuracy helpers ───────────────────────────────────────────────────────────
+
+def calculate_accuracy(total_fields, total_mismatches):
+    """Return accuracy percentage given total fields compared and mismatches."""
+    if total_fields > 0:
+        return (total_fields - total_mismatches) / total_fields * 100
+    return 0.0
+
+
+def print_accuracy_report(total_fields, total_mismatches, accuracy, per_field_accuracy=None):
+    """Print a formatted accuracy report to stdout, with optional per-field breakdown."""
+    print(f"\n--- Accuracy Report ---")
+    print(f"Total fields compared: {total_fields}")
+    print(f"Mismatches found:      {total_mismatches}")
+    print(f"Matches:               {total_fields - total_mismatches}")
+    print(f"Overall accuracy:      {accuracy:.2f}%")
+
+    if per_field_accuracy:
+        print(f"\n--- Per-Field Accuracy ---")
+        for field, field_accuracy in per_field_accuracy.items():
+            print(f"  {field:<15} {field_accuracy:.2f}%")
 
 
 # ── CSV helpers ────────────────────────────────────────────────────────────────
