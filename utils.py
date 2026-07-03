@@ -60,6 +60,46 @@ def normalize_date(value):
 
 # ── Fuzzy matching ─────────────────────────────────────────────────────────────
 
+def normalize_postcode(address):
+    """Normalize postcode within an address by removing spaces and normalizing separators."""
+    if pd.isna(address):
+        return address
+    address = str(address)
+    address = address.replace(' | ', ', ').replace('| ', ', ').replace(' |', ', ').replace('|', ', ')
+    def _strip_postcode_space(m):
+        return m.group(0).replace(' ', '').lower()
+    address = re.sub(r'[A-Za-z]{1,2}\d{1,2}[A-Za-z]?\s?\d[A-Za-z]{2}', _strip_postcode_space, address)
+    address = re.sub(r'\s+', ' ', address).strip()
+    return address
+
+
+def clean_employer(value):
+    """Remove 'PAYSLIP', 'payslip', and 'payslip-' prefix from employer field."""
+    if pd.isna(value) or value == "":
+        return value
+    value = re.sub(r'(?i)\bpayslip[-\u2013\u2014]?\s*', '', str(value)).strip()
+    value = re.sub(r'\s+', ' ', value).strip()
+    return value if value else None
+
+
+def extract_customer_id(filename):
+    """Extract customer ID (e.g. CUST-1001) from a filename."""
+    match = re.search(r'(CUST-\d+)', str(filename))
+    return match.group(1) if match else None
+
+
+def extract_document_type(filename):
+    """Extract document type from filename prefix."""
+    fname = str(filename).lower()
+    if fname.startswith('bank_statement'):
+        return 'Bank Statement'
+    elif fname.startswith('payslip'):
+        return 'Payslip'
+    elif fname.startswith('utility_bill'):
+        return 'Utility Bill'
+    return 'Unknown'
+
+
 def fuzzy_match_name(name, choices, threshold=70):
     if pd.isna(name) or not choices:
         return None
@@ -67,21 +107,6 @@ def fuzzy_match_name(name, choices, threshold=70):
     if match and match[1] >= threshold:
         return match[0]
     return None
-
-
-def normalize_postcode(address):
-    """Normalize postcode within an address by removing spaces and lowering."""
-    if pd.isna(address):
-        return address
-    address = str(address)
-    # Replace pipe separators with commas for consistent formatting
-    address = address.replace(' | ', ', ').replace('| ', ', ').replace(' |', ', ').replace('|', ', ')
-    # Normalize postcode spacing: find postcode and remove internal spaces
-    def _strip_postcode_space(m):
-        return m.group(0).replace(' ', '').lower()
-    address = re.sub(r'[A-Za-z]{1,2}\d{1,2}[A-Za-z]?\s?\d[A-Za-z]{2}', _strip_postcode_space, address)
-    address = re.sub(r'\s+', ' ', address).strip()
-    return address
 
 
 # ── Postcode helpers ───────────────────────────────────────────────────────────
