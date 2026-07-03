@@ -32,6 +32,27 @@ results = []
 
 from PIL import ImageEnhance
 
+
+def left_text_ratio(img):
+    """Return the ratio of OCR text characters in the left half vs total.
+
+    English documents have left-aligned text, so correctly oriented
+    images will have more text on the left side.
+    """
+    width = img.width
+    left_half = img.crop((0, 0, width // 2, img.height))
+    right_half = img.crop((width // 2, 0, width, img.height))
+    try:
+        left_text = pytesseract.image_to_string(left_half).strip()
+        right_text = pytesseract.image_to_string(right_half).strip()
+    except pytesseract.TesseractError:
+        return 0.5
+    total = len(left_text) + len(right_text)
+    if total == 0:
+        return 0.5
+    return len(left_text) / total
+
+
 def correct_rotation(filepath):
     image = Image.open(filepath)
 
@@ -44,45 +65,53 @@ def correct_rotation(filepath):
         osd_data = pytesseract.image_to_osd(boosted, output_type='dict')
         rotation_angle = osd_data['rotate']
         if rotation_angle != 0:
-            # If 90° or 270° detected, try both and recheck to pick the correct one
+            # Try all candidate rotations and pick the best one
+            candidates = [rotation_angle]
             if rotation_angle in (90, 270):
-                rotated_90 = image.rotate(90, expand=True)
-                rotated_270 = image.rotate(270, expand=True)
+                candidates = [90, 270]
+            elif rotation_angle == 180:
+                candidates = [180]
 
-                # Recheck both rotations to see which produces 0° OSD
-                try:
-                    boosted_90 = rotated_90.resize(
-                        (rotated_90.width * 2, rotated_90.height * 2), Image.LANCZOS
-                    )
-                    recheck_90 = pytesseract.image_to_osd(boosted_90, output_type='dict')['rotate']
-                except pytesseract.TesseractError:
-                    recheck_90 = 999
+            best_rotation = rotation_angle
+            best_score = -1
 
-                try:
-                    boosted_270 = rotated_270.resize(
-                        (rotated_270.width * 2, rotated_270.height * 2), Image.LANCZOS
-                    )
-                    recheck_270 = pytesseract.image_to_osd(boosted_270, output_type='dict')['rotate']
-                except pytesseract.TesseractError:
-                    recheck_270 = 999
+            for angle in candidates:
+                rotated = image.rotate(angle, expand=True)
+                score = left_text_ratio(rotated)
+                print(f"  Trying {angle}° rotation: left-text ratio = {score:.2f}")
+                if score > best_score:
+                    best_score = score
+                    best_rotation = angle
 
-                if recheck_90 == 0:
-                    print(f"Detected {rotation_angle}°, verified 90° rotation is correct")
-                    image = rotated_90
-                elif recheck_270 == 0:
-                    print(f"Detected {rotation_angle}°, verified 270° rotation is correct")
-                    image = rotated_270
-                else:
-                    # Fallback: use the originally detected angle
-                    print(f"Recheck inconclusive, applying detected {rotation_angle}°")
-                    image = image.rotate(rotation_angle, expand=True)
+            # Also check if 0° (no rotation) is better
+            original_score = left_text_ratio(image)
+            print(f"  Original (0°): left-text ratio = {original_score:.2f}")
+
+            if original_score >= best_score and original_score >= 0.45:
+                print("Original orientation is best, no rotation applied")
             else:
-                print(f"Correcting rotation: {rotation_angle}°")
-                image = image.rotate(rotation_angle, expand=True)
+                print(f"Applying {best_rotation}° rotation (left-text ratio: {best_score:.2f})")
+                image = image.rotate(best_rotation, expand=True)
         else:
             print("No rotation needed")
     except pytesseract.TesseractError as e:
-        print(f"OSD still failed: {e}")
+        print(f"OSD failed: {e}, trying text-distribution fallback")
+        # Fallback: try all four orientations and pick the best
+        best_rotation = 0
+        best_score = left_text_ratio(image)
+        print(f"  Original (0°): left-text ratio = {best_score:.2f}")
+        for angle in [90, 180, 270]:
+            rotated = image.rotate(angle, expand=True)
+            score = left_text_ratio(rotated)
+            print(f"  Trying {angle}° rotation: left-text ratio = {score:.2f}")
+            if score > best_score:
+                best_score = score
+                best_rotation = angle
+        if best_rotation != 0:
+            print(f"Applying {best_rotation}° rotation (left-text ratio: {best_score:.2f})")
+            image = image.rotate(best_rotation, expand=True)
+        else:
+            print("Original orientation is best, no rotation applied")
 
     # greyscale conversion
     #image = image.convert('L')

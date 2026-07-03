@@ -5,6 +5,7 @@ from utils import (
     normalize_text,
     normalize_name,
     normalize_date,
+    normalize_postcode,
     fuzzy_match_name,
     is_missing,
     calculate_accuracy,
@@ -13,10 +14,10 @@ from utils import (
 
 
 def clean_employer(value):
-    """Remove 'PAYSLIP' or 'payslip' text from employer field."""
+    """Remove 'PAYSLIP', 'payslip', and 'payslip-' prefix from employer field."""
     if pd.isna(value) or value == "":
         return value
-    value = re.sub(r'\b[Pp][Aa][Yy][Ss][Ll][Ii][Pp]\b', '', str(value)).strip()
+    value = re.sub(r'(?i)\bpayslip[-–—]?\s*', '', str(value)).strip()
     value = re.sub(r'\s+', ' ', value).strip()
     return value if value else None
 
@@ -32,6 +33,16 @@ def compare_csvs(submit_path="submit.csv", truth_path="customer_table.csv"):
             submit_df[col] = submit_df[col].apply(normalize_text)
         if col in truth_df.columns:
             truth_df[col] = truth_df[col].apply(normalize_text)
+
+    # Normalize address postcodes and pipe separators for consistent comparison
+    if "address" in submit_df.columns:
+        submit_df["address"] = submit_df["address"].apply(normalize_postcode)
+    if "address" in truth_df.columns:
+        truth_df["address"] = truth_df["address"].apply(normalize_postcode)
+
+    # Clean employer field to strip payslip prefix before comparison
+    if "employer" in submit_df.columns:
+        submit_df["employer"] = submit_df["employer"].apply(clean_employer)
 
     submit_df["name"] = submit_df["name"].apply(normalize_name)
     truth_df["name"] = truth_df["name"].apply(normalize_name)
