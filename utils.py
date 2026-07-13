@@ -60,17 +60,29 @@ def normalize_date(value):
 
 # ── Fuzzy matching ─────────────────────────────────────────────────────────────
 
-def normalize_postcode(address):
-    """Normalize postcode within an address by removing spaces and normalizing separators."""
+def normalize_address(address):
+    """Normalize an address for comparison: remove commas, pipes, collapse whitespace, strip postcode spaces."""
     if pd.isna(address):
         return address
     address = str(address)
-    address = address.replace(' | ', ', ').replace('| ', ', ').replace(' |', ', ').replace('|', ', ')
+    # Replace pipe separators
+    address = address.replace('|', ' ')
+    # Remove all commas
+    address = address.replace(',', '')
+    # Lowercase
+    address = address.lower()
+    # Strip postcode internal spaces
     def _strip_postcode_space(m):
-        return m.group(0).replace(' ', '').lower()
-    address = re.sub(r'[A-Za-z]{1,2}\d{1,2}[A-Za-z]?\s?\d[A-Za-z]{2}', _strip_postcode_space, address)
+        return m.group(0).replace(' ', '')
+    address = re.sub(r'[a-z]{1,2}\d{1,2}[a-z]?\s?\d[a-z]{2}', _strip_postcode_space, address)
+    # Collapse whitespace
     address = re.sub(r'\s+', ' ', address).strip()
     return address
+
+
+def normalize_postcode(address):
+    """Normalize postcode within an address by removing spaces and normalizing separators."""
+    return normalize_address(address)
 
 
 def clean_employer(value):
@@ -88,58 +100,8 @@ def extract_customer_id(filename):
     return match.group(1) if match else None
 
 
-def load_customer_lookup(truth_path="customer_table.csv"):
-    """Load customer table and build a lookup by customer_id and a list of all names."""
-    try:
-        df = pd.read_csv(truth_path)
-    except FileNotFoundError:
-        return {}, []
-    id_lookup = {}
-    if "customer_id" in df.columns:
-        for _, row in df.iterrows():
-            cid = str(row["customer_id"]).strip()
-            id_lookup[cid] = row.to_dict()
-    all_names = df["name"].dropna().unique().tolist()
-    return id_lookup, all_names
-
-
-def semantic_correct_name(extracted_name, filename, id_lookup, all_names):
-    """Correct an extracted name using customer table lookup.
-
-    1. Try direct customer ID lookup from the filename.
-    2. Fall back to fuzzy matching against all known names.
-    Returns (corrected_name, was_corrected).
-    """
-    if pd.isna(extracted_name) or not extracted_name:
-        return extracted_name, False
-
-    # Try customer ID lookup first
-    cust_id = extract_customer_id(filename)
-    if cust_id and cust_id in id_lookup:
-        expected_name = id_lookup[cust_id].get("name", "")
-        if expected_name:
-            norm_extracted = normalize_name(extracted_name)
-            norm_expected = normalize_name(expected_name)
-            score = fuzz.token_sort_ratio(norm_extracted, norm_expected)
-            if score >= 50:
-                print(f"  Name corrected via customer ID: '{extracted_name}' -> '{expected_name}' (score: {score})")
-                return expected_name, True
-
-    # Fuzzy match against all known names
-    norm_extracted = normalize_name(extracted_name)
-    match = process.extractOne(norm_extracted, [normalize_name(n) for n in all_names], scorer=fuzz.token_sort_ratio)
-    if match and match[1] >= 60:
-        idx = [normalize_name(n) for n in all_names].index(match[0])
-        corrected = all_names[idx]
-        if corrected.lower().strip() != extracted_name.lower().strip():
-            print(f"  Name corrected via fuzzy match: '{extracted_name}' -> '{corrected}' (score: {match[1]})")
-            return corrected, True
-
-    return extracted_name, False
-
-
 def extract_dates_from_text(text):
-    """Extract date-like patterns from OCR text."""
+    """Extract date-like patterns from OCR text (document-only, no customer table)."""
     patterns = [
         r'\b(\d{4}[-/]\d{2}[-/]\d{2})\b',
         r'\b(\d{2}[-/]\d{2}[-/]\d{4})\b',
@@ -149,43 +111,6 @@ def extract_dates_from_text(text):
     for pattern in patterns:
         dates.extend(re.findall(pattern, text))
     return dates
-
-
-def cross_validate_date(llm_date, ocr_text, filename, id_lookup):
-    """Cross-validate extracted DOB using OCR text and customer table.
-
-    Returns (best_date, was_corrected).
-    """
-    if pd.isna(llm_date) or not llm_date:
-        # Try to find date in OCR text
-        ocr_dates = extract_dates_from_text(ocr_text)
-        for d in ocr_dates:
-            normalized = normalize_date(d)
-            if normalized:
-                print(f"  DOB recovered from OCR text: {normalized}")
-                return normalized, True
-        return llm_date, False
-
-    normalized_llm = normalize_date(llm_date)
-
-    # Check against customer table
-    cust_id = extract_customer_id(filename)
-    if cust_id and cust_id in id_lookup:
-        expected_dob = id_lookup[cust_id].get("date_of_birth", "")
-        if expected_dob:
-            normalized_expected = normalize_date(expected_dob)
-            if normalized_llm == normalized_expected:
-                return normalized_llm, False
-
-            # Check if OCR text contains the expected date
-            ocr_dates = extract_dates_from_text(ocr_text)
-            for d in ocr_dates:
-                normalized_ocr = normalize_date(d)
-                if normalized_ocr == normalized_expected:
-                    print(f"  DOB corrected via OCR + customer table: '{llm_date}' -> '{normalized_expected}'")
-                    return normalized_expected, True
-
-    return normalized_llm if normalized_llm else llm_date, False
 
 
 def extract_document_type(filename):
