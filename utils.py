@@ -58,9 +58,85 @@ def normalize_date(value):
     return None
 
 
+def normalize_address(address):
+    """Normalize an address for comparison: remove pipes, commas, collapse whitespace, strip postcode spaces."""
+    if pd.isna(address):
+        return address
+    address = str(address)
+    address = address.replace('|', ' ')
+    address = address.replace(',', '')
+    address = address.lower()
+    def _strip_postcode_space(m):
+        return m.group(0).replace(' ', '')
+    address = re.sub(r'[a-z]{1,2}\d{1,2}[a-z]?\s?\d[a-z]{2}', _strip_postcode_space, address)
+    address = re.sub(r'\s+', ' ', address).strip()
+    return address
 # ── Fuzzy matching ─────────────────────────────────────────────────────────────
 
-def fuzzy_match_name(name, choices, threshold=85):
+
+def normalize_address(address):
+    """Normalize an address for comparison: remove commas, pipes, collapse whitespace, strip postcode spaces."""
+    if pd.isna(address):
+        return address
+    address = str(address)
+    # Replace pipe separators
+    address = address.replace('|', ' ')
+    # Remove all commas
+    address = address.replace(',', '')
+    # Lowercase
+    address = address.lower()
+    # Strip postcode internal spaces
+    def _strip_postcode_space(m):
+        return m.group(0).replace(' ', '')
+    address = re.sub(r'[a-z]{1,2}\d{1,2}[a-z]?\s?\d[a-z]{2}', _strip_postcode_space, address)
+    # Collapse whitespace
+    address = re.sub(r'\s+', ' ', address).strip()
+    return address
+
+
+
+def clean_employer(value):
+    """Remove 'PAYSLIP', 'payslip', and 'payslip-' prefix from employer field."""
+    if pd.isna(value) or value == "":
+        return value
+    value = re.sub(r'(?i)\bpayslip[-\u2013\u2014]?\s*', '', str(value)).strip()
+    value = re.sub(r'\s+', ' ', value).strip()
+    return value if value else None
+
+
+def extract_customer_id(filename):
+    """Extract customer ID (e.g. CUST-1001) from a filename."""
+    match = re.search(r'(CUST-\d+)', str(filename))
+    return match.group(1) if match else None
+
+
+def extract_dates_from_text(text):
+    """Extract date-like patterns from OCR text (document-only, no customer table)."""
+    patterns = [
+        r'\b(\d{4}[-/]\d{2}[-/]\d{2})\b',
+        r'\b(\d{2}[-/]\d{2}[-/]\d{4})\b',
+        r'\b(\d{2}[-/]\d{2}[-/]\d{2})\b',
+    ]
+    dates = []
+    for pattern in patterns:
+        dates.extend(re.findall(pattern, text))
+    return dates
+
+
+def extract_document_type(filename):
+    """Extract document type from filename prefix."""
+    fname = str(filename).lower()
+    if fname.startswith('bank_statement'):
+        return 'Bank Statement'
+    elif fname.startswith('payslip'):
+        return 'Payslip'
+    elif fname.startswith('utility_bill'):
+        return 'Utility Bill'
+    return 'Unknown'
+
+
+def fuzzy_match_name(name, choices, threshold=70):
+
     if pd.isna(name) or not choices:
         return None
     match = process.extractOne(name, choices, scorer=fuzz.token_sort_ratio)

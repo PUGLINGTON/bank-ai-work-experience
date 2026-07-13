@@ -7,10 +7,10 @@ from utils import (
     normalize_date,
     fuzzy_match_name,
     is_missing,
+    clean_employer,
     calculate_accuracy,
     print_accuracy_report,
 )
-
 
 def clean_employer(value):
     """Remove 'PAYSLIP' or 'payslip' text from employer field."""
