@@ -1,5 +1,5 @@
 from mistralai import Mistral
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 import os
 from dotenv import load_dotenv
@@ -12,7 +12,7 @@ from utils import (
     normalize_text,
     normalize_name,
     normalize_date,
-    normalize_postcode,
+    normalize_address,
     fuzzy_match_name,
     extract_postcode,
     remove_postcode,
@@ -24,23 +24,41 @@ from utils import (
     extract_customer_id,
     extract_document_type,
     calculate_accuracy,
-    load_customer_lookup,
-    semantic_correct_name,
-    cross_validate_date,
 )
 
 load_dotenv(dotenv_path="credentials")
 
-mistral_api_key = os.getenv("MISTRAL_API_KEY")
-mistral_client = Mistral(api_key=mistral_api_key)
-
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Only set the Windows Tesseract path if it actually exists, so the same code
+# runs unchanged on Linux/Mac where tesseract is already on PATH.
+_WIN_TESSERACT = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+if os.path.exists(_WIN_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = _WIN_TESSERACT
 
 DATA_FOLDER = "data"
 FIELDNAMES = ["filename", "name", "address", "date_of_birth", "occupation", "employer"]
+API_DELAY_SECONDS = 10
 
-files = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".png") and not f.startswith("._")]
+files = (
+    [f for f in os.listdir(DATA_FOLDER) if f.endswith(".png") and not f.startswith("._")]
+    if os.path.isdir(DATA_FOLDER)
+    else []
+)
 results = []
+
+_mistral_client = None
+
+
+def get_mistral_client():
+    """Lazily create the Mistral client so importing this module has no side effects."""
+    global _mistral_client
+    if _mistral_client is None:
+        api_key = os.getenv("MISTRAL_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "MISTRAL_API_KEY not found. Add it to the 'credentials' file."
+            )
+        _mistral_client = Mistral(api_key=api_key)
+    return _mistral_client
 
 
 def comparison():
@@ -56,11 +74,11 @@ def comparison():
             if col in truth_df.columns:
                 truth_df[col] = truth_df[col].apply(normalize_text)
 
-        # Normalize address postcodes and pipe separators
+        # Normalize addresses: remove commas, pipes, collapse whitespace, strip postcode spaces
         if "address" in submit_df.columns:
-            submit_df["address"] = submit_df["address"].apply(normalize_postcode)
+            submit_df["address"] = submit_df["address"].apply(normalize_address)
         if "address" in truth_df.columns:
-            truth_df["address"] = truth_df["address"].apply(normalize_postcode)
+            truth_df["address"] = truth_df["address"].apply(normalize_address)
 
         # Clean employer field to strip payslip prefix
         if "employer" in submit_df.columns:
@@ -191,6 +209,23 @@ def comparison():
         for doc_type, count in type_counts.items():
             print(f"  {doc_type}: {count}")
 
+    return known_df, unknown_df, total_fields, total_mismatches, field_stats
+
+
+def preprocess_for_ocr(image):
+    """Grayscale, auto-contrast, upscale small images, and sharpen to boost OCR accuracy."""
+    gray = image.convert("L")
+    gray = ImageOps.autocontrast(gray)
+    longest = max(gray.size)
+    if longest < 2000:
+        scale = 2000 / longest
+        gray = gray.resize(
+            (int(gray.width * scale), int(gray.height * scale)),
+            Image.LANCZOS,
+        )
+    gray = gray.filter(ImageFilter.SHARPEN)
+    return gray
+
 
 def left_text_ratio(img):
     """Return the ratio of OCR text characters in the left half vs total.
@@ -273,9 +308,10 @@ def correct_rotation(filepath):
 
 
 def ocr_preread(image):
-    """Run OCR on the image to get raw text for cross-validation."""
+    """Run OCR on a preprocessed image to get clean raw text for cross-validation."""
     try:
-        text = pytesseract.image_to_string(image)
+        processed = preprocess_for_ocr(image)
+        text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
         return text.strip()
     except pytesseract.TesseractError:
         return ""
@@ -305,8 +341,9 @@ def extract_info(image, ocr_text=""):
             f"{ocr_text[:3000]}"
         )
 
-    response = mistral_client.chat.complete(
+    response = get_mistral_client().chat.complete(
         model="pixtral-large-latest",
+        temperature=0,
         messages=[
             {"role": "user", "content": [
                 {"type": "text", "text": prompt},
@@ -318,11 +355,110 @@ def extract_info(image, ocr_text=""):
     return parse_llm_json(response.choices[0].message.content)
 
 
+def wipe_files():
+    files_to_wipe = ["submit.csv", "final_submit.csv", "known_mismatches.csv", "unknown_customers.csv", "mismatches.csv"]
+    for f in files_to_wipe:
+        if os.path.exists(f):
+            os.remove(f)
+            print(f"Wiped: {f}")
+
+
+def validate_extraction(data, ocr_text, filename):
+    """Self-consistency checks using only the document itself (no customer table)."""
+    warnings = []
+
+    # Check name appears in OCR text
+    name = data.get("name")
+    if name and ocr_text:
+        name_lower = name.lower()
+        ocr_lower = ocr_text.lower()
+        name_parts = name_lower.split()
+        found_parts = sum(1 for part in name_parts if part in ocr_lower)
+        if found_parts < len(name_parts) / 2:
+            warnings.append(f"  WARNING: name '{name}' not well-supported by OCR text")
+
+    # Check DOB appears in OCR text
+    dob = data.get("date_of_birth")
+    if dob and ocr_text:
+        dob_variants = [dob, dob.replace("-", "/"), dob.replace("-", "")]
+        if not any(v in ocr_text for v in dob_variants):
+            warnings.append(f"  WARNING: DOB '{dob}' not found in OCR text — may be misread")
+
+    for w in warnings:
+        print(w)
+
+    return warnings
+
+
+def process_file(filepath):
+    """Rotation-correct, OCR, and extract a single document (document-only, bank-compliant).
+
+    Returns (data, ocr_text, warnings). No customer table is used here.
+    """
+    filename = os.path.basename(filepath)
+    image = correct_rotation(filepath)
+    ocr_text = ocr_preread(image)
+    data = extract_info(image, ocr_text)
+    warnings = []
+    if data is not None:
+        data["filename"] = filename
+        if data.get("employer"):
+            data["employer"] = clean_employer(data["employer"])
+        warnings = validate_extraction(data, ocr_text, filename)
+    return data, ocr_text, warnings
+
+
+def compare_record(data, truth_path="customer_table.csv"):
+    """Audit-stage comparison of one extracted record against the customer table.
+
+    Returns (rows, matched_name) where rows is a list of per-field dicts with
+    keys field/extracted/expected/status. matched_name is None if the person is
+    not found in the customer table.
+    """
+    truth_df = pd.read_csv(truth_path)
+
+    for col in ["address", "occupation", "employer"]:
+        if col in truth_df.columns:
+            truth_df[col] = truth_df[col].apply(normalize_text)
+    if "address" in truth_df.columns:
+        truth_df["address"] = truth_df["address"].apply(normalize_address)
+    truth_df["name"] = truth_df["name"].apply(normalize_name)
+    truth_df["date_of_birth"] = truth_df["date_of_birth"].apply(normalize_date)
+
+    rec = {
+        "name": normalize_name(data.get("name")),
+        "date_of_birth": normalize_date(data.get("date_of_birth")),
+        "address": normalize_address(normalize_text(data.get("address"))),
+        "occupation": normalize_text(data.get("occupation")),
+        "employer": clean_employer(normalize_text(data.get("employer"))),
+    }
+
+    truth_names = truth_df["name"].dropna().unique().tolist()
+    matched_name = fuzzy_match_name(rec["name"], truth_names)
+
+    rows = []
+    if matched_name is None:
+        return rows, None
+
+    truth_row = truth_df[truth_df["name"] == matched_name].iloc[0]
+    for field in ["name", "date_of_birth", "address", "occupation", "employer"]:
+        extracted = rec.get(field)
+        expected = truth_row.get(field)
+        if field == "employer" and is_missing(extracted):
+            continue
+        if is_missing(extracted) and is_missing(expected):
+            continue
+        rows.append({
+            "field": field,
+            "extracted": extracted,
+            "expected": expected,
+            "status": "match" if extracted == expected else "mismatch",
+        })
+    return rows, matched_name
+
+
 def store():
     ensure_csv("submit.csv", FIELDNAMES)
-
-    # Load customer table for semantic correction
-    id_lookup, all_names = load_customer_lookup("customer_table.csv")
 
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
@@ -338,19 +474,8 @@ def store():
         if data is not None:
             data["filename"] = filename
 
-            # Semantic name correction
-            corrected_name, name_was_corrected = semantic_correct_name(
-                data.get("name"), filename, id_lookup, all_names
-            )
-            if name_was_corrected:
-                data["name"] = corrected_name
-
-            # Date cross-validation
-            corrected_dob, dob_was_corrected = cross_validate_date(
-                data.get("date_of_birth"), ocr_text, filename, id_lookup
-            )
-            if dob_was_corrected:
-                data["date_of_birth"] = corrected_dob
+            # Self-consistency validation (no customer table needed)
+            validate_extraction(data, ocr_text, filename)
 
             results.append(data)
             print(json.dumps(data, indent=2))
@@ -359,7 +484,7 @@ def store():
                 writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
                 writer.writerow(data)
 
-        time.sleep(10)
+        time.sleep(API_DELAY_SECONDS)
 
     df = pd.DataFrame(results)
 
@@ -372,5 +497,7 @@ def store():
     df.to_csv("final_submit.csv", index=False)
 
 
-store()
-comparison()
+if __name__ == "__main__":
+    wipe_files()
+    store()
+    comparison()
