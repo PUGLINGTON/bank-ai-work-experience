@@ -20,13 +20,6 @@ from utils import (
     parse_llm_json,
     ensure_csv,
     is_missing,
-    clean_employer,
-    extract_customer_id,
-    extract_document_type,
-    calculate_accuracy,
-    load_customer_lookup,
-    semantic_correct_name,
-    cross_validate_date,
 )
 
 load_dotenv(dotenv_path="credentials")
@@ -359,22 +352,6 @@ def store():
 
         data = extract_info(image, ocr_text)
         if data is not None:
-            data["filename"] = filename
-
-            # Semantic name correction
-            corrected_name, name_was_corrected = semantic_correct_name(
-                data.get("name"), filename, id_lookup, all_names
-            )
-            if name_was_corrected:
-                data["name"] = corrected_name
-
-            # Date cross-validation
-            corrected_dob, dob_was_corrected = cross_validate_date(
-                data.get("date_of_birth"), ocr_text, filename, id_lookup
-            )
-            if dob_was_corrected:
-                data["date_of_birth"] = corrected_dob
-
             results.append(data)
             print(json.dumps(data, indent=2))
 
@@ -394,6 +371,8 @@ def store():
     df['address'] = df['address'].apply(remove_postcode)
     df.to_csv("final_submit.csv", index=False)
 
-wipe_files() 
+    add_postcode_column(df)
+
+
 store()
 comparison()
