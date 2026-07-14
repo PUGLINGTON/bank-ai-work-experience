@@ -345,7 +345,7 @@ def extract_info(image, ocr_text=""):
         )
 
     response = get_mistral_client().chat.complete(
-        model="pixtral-large-latest",
+        model="pixtral-12b-2409",
         temperature=0,
         messages=[
             {"role": "user", "content": [
@@ -479,7 +479,7 @@ def refine_field(image, field_name, current_value):
     )
     try:
         response = get_mistral_client().chat.complete(
-            model="pixtral-large-latest",
+            model="pixtral-12b-2409",
             temperature=0,
             messages=[
                 {"role": "user", "content": [
