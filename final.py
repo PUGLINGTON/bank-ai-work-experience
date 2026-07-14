@@ -325,22 +325,36 @@ def extract_info(image, ocr_text=""):
 
     # Build prompt with OCR context for cross-validation
     prompt = (
-        "Extract the following fields from this document image and return ONLY valid JSON, "
-        "no markdown formatting, no explanation: "
-        "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
-        "occupation(often seen with job in front, DO NOT include the word 'Job'), "
-        "employer(for bank statements and utility bills do not include employer). "
-        "Read names and addresses carefully and exactly as written. "
-        "Text with no meaning associated with the fields specified should be ignored. "
-        "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
-        "Set any missing fields to null."
+        "You are extracting identity details from a scanned UK bank statement, "
+        "payslip, or utility bill. Return ONLY a valid JSON object (no markdown "
+        "fences, no commentary) with exactly these keys:\n"
+        '  "name", "address", "date_of_birth", "occupation", "employer".\n\n'
+        "Rules for each field:\n"
+        "- name: the person the document belongs to (the account holder / "
+        "employee / customer). NOT the bank, company, council, or document "
+        "title. Copy it exactly as printed, including spelling.\n"
+        "- address: the person's full postal address, including the postcode, "
+        "as one string.\n"
+        "- date_of_birth: the person's date of birth in YYYY-MM-DD format. It is "
+        "usually labelled 'DOB' or 'Date of Birth'. Do NOT use the statement "
+        "date, issue date, or any other date on the page.\n"
+        "- occupation: the person's job title. Return only the job title itself "
+        "(e.g. 'Chef'), never the label word 'Job' or 'Occupation'.\n"
+        "- employer: the employing organisation. This exists ONLY on payslips; "
+        "for bank statements and utility bills set it to null. Never put the "
+        "word 'Payslip' here.\n\n"
+        "General rules:\n"
+        "- Return the VALUE only, never the printed field label next to it.\n"
+        "- Ignore headers, logos, watermarks, and marketing text.\n"
+        "- If a field is not present, set it to null. Do not guess.\n"
     )
 
     if ocr_text:
         prompt += (
-            "\n\nFor cross-reference, here is the raw OCR text extracted from this document. "
-            "Use it to double-check your reading of names, dates, and addresses — "
-            "if the image is unclear, prefer the OCR text for spelling:\n\n"
+            "\nBelow is raw OCR text from the same document. Use it to confirm "
+            "the spelling of names, dates, and addresses; when the image is "
+            "unclear, prefer the OCR spelling. The OCR text may contain extra "
+            "noise — only use it to cross-check the fields above:\n\n"
             f"{ocr_text[:3000]}"
         )
 

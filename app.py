@@ -344,6 +344,72 @@ def render_flagged_tab():
         render_result_detail(result)
 
 
+def compute_stats(results):
+    """Aggregate per-field match counts and document-status counts across results."""
+    field_order = ["name", "date_of_birth", "address", "postcode",
+                   "occupation", "employer"]
+    per_field = {f: {"match": 0, "mismatch": 0} for f in field_order}
+    status_counts = {"ok": 0, "flagged": 0, "unknown": 0, "error": 0}
+
+    for r in results:
+        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+        # Only known (matched) customers contribute field-level accuracy.
+        if r.get("matched_name") is None:
+            continue
+        for row in r.get("rows", []):
+            bucket = per_field.setdefault(row["field"], {"match": 0, "mismatch": 0})
+            bucket[row["status"]] = bucket.get(row["status"], 0) + 1
+
+    rows = []
+    for f in field_order:
+        m, mm = per_field[f]["match"], per_field[f]["mismatch"]
+        total = m + mm
+        if total:
+            rows.append({"field": f, "match_rate_%": round(100 * m / total, 1),
+                         "checked": total, "mismatches": mm})
+    return rows, status_counts
+
+
+def render_metrics_tab():
+    st.subheader("Match success rate")
+    st.caption("How often each extracted field matches the customer table "
+               "(known customers only).")
+
+    results = st.session_state.results
+    if not results:
+        st.info("No results yet. Process a document or scan a folder first.")
+        return
+
+    field_rows, status_counts = compute_stats(results)
+
+    matched = sum(1 for r in results if r.get("matched_name"))
+    total_checked = sum(r["checked"] for r in field_rows)
+    total_match = sum(int(round(r["match_rate_%"] / 100 * r["checked"]))
+                      for r in field_rows)
+    overall = 100 * total_match / total_checked if total_checked else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Overall field match", f"{overall:.0f}%")
+    c2.metric("Fields checked", total_checked)
+    c3.metric("Matched customers", matched)
+
+    if field_rows:
+        st.markdown("**Match rate by field**")
+        chart_df = pd.DataFrame(field_rows).set_index("field")[["match_rate_%"]]
+        st.bar_chart(chart_df, y="match_rate_%", height=300)
+        st.dataframe(pd.DataFrame(field_rows), use_container_width=True,
+                     hide_index=True)
+    else:
+        st.info("No known customers matched yet, so no field accuracy to show.")
+
+    st.markdown("**Documents by status**")
+    status_df = pd.DataFrame(
+        [{"status": k, "count": v} for k, v in status_counts.items() if v]
+    )
+    if not status_df.empty:
+        st.bar_chart(status_df.set_index("status"), height=260)
+
+
 def render_issues_tab():
     st.subheader("Issues to review")
     top = st.columns([1, 1, 4])
@@ -396,8 +462,9 @@ st.caption(
     "customer table. Address is split into street and postcode for both display "
     "and comparison."
 )
-tab_process, tab_folder, tab_flagged, tab_issues = st.tabs(
-    ["Process Document", "Scan Folder", "Flagged Files", "Issues to Review"]
+tab_process, tab_folder, tab_flagged, tab_metrics, tab_issues = st.tabs(
+    ["Process Document", "Scan Folder", "Flagged Files",
+     "Accuracy", "Issues to Review"]
 )
 with tab_process:
     render_process_tab()
@@ -405,5 +472,7 @@ with tab_folder:
     render_folder_tab()
 with tab_flagged:
     render_flagged_tab()
+with tab_metrics:
+    render_metrics_tab()
 with tab_issues:
     render_issues_tab()
