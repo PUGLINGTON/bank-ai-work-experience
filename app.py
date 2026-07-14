@@ -117,6 +117,7 @@ def run_one(path):
         "warnings": [],
         "refinements": [],
         "matched_name": None,
+        "relation": None,
         "rows": [],
         "mismatches": [],
     }
@@ -142,7 +143,7 @@ def run_one(path):
 
     if os.path.exists(TRUTH_PATH):
         try:
-            rows, matched_name = compare_record(data, TRUTH_PATH)
+            rows, matched_name, relation = compare_record(data, TRUTH_PATH)
         except Exception as exc:
             result["status"] = "error"
             result["error"] = f"comparison failed: {exc}"
@@ -150,10 +151,16 @@ def run_one(path):
 
         result["rows"] = rows
         result["matched_name"] = matched_name
+        result["relation"] = relation
         if matched_name is None:
-            result["status"] = "unknown"
-            add_issue(filename, "name", data.get("name", ""),
-                      "Not found in customer table")
+            if relation == "none":
+                result["status"] = "unrelated"
+                add_issue(filename, "name", data.get("name", ""),
+                          "No relation to customer table (name, DOB, and postcode all unmatched)")
+            else:
+                result["status"] = "unknown"
+                add_issue(filename, "name", data.get("name", ""),
+                          "Name not found, but DOB/postcode relates to a customer — possible misread")
         else:
             mismatches = [r for r in rows if r["status"] == "mismatch"]
             result["mismatches"] = mismatches
@@ -222,7 +229,12 @@ def render_result_detail(result):
         st.warning(f"{TRUTH_PATH} not found — comparison skipped.")
         return
     if result["matched_name"] is None:
-        st.warning("Not found in customer table — logged as an unknown record.")
+        if result.get("relation") == "none":
+            st.error("No relation to the customer table — name, DOB, and postcode "
+                     "all match no customer. Logged separately (not counted in matches).")
+        else:
+            st.warning("Name not found in customer table, but the DOB or postcode "
+                       "relates to a customer — possible misread. Logged for review.")
         return
 
     cmp_df = pd.DataFrame(result["rows"])[["field", "extracted", "expected", "status"]]
@@ -349,7 +361,7 @@ def compute_stats(results):
     field_order = ["name", "date_of_birth", "address", "postcode",
                    "occupation", "employer"]
     per_field = {f: {"match": 0, "mismatch": 0} for f in field_order}
-    status_counts = {"ok": 0, "flagged": 0, "unknown": 0, "error": 0}
+    status_counts = {"ok": 0, "flagged": 0, "unknown": 0, "unrelated": 0, "error": 0}
 
     for r in results:
         status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
@@ -388,10 +400,13 @@ def render_metrics_tab():
                       for r in field_rows)
     overall = 100 * total_match / total_checked if total_checked else 0.0
 
-    c1, c2, c3 = st.columns(3)
+    unrelated = status_counts.get("unrelated", 0)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Overall field match", f"{overall:.0f}%")
     c2.metric("Fields checked", total_checked)
     c3.metric("Matched customers", matched)
+    c4.metric("Not in customer table", unrelated,
+              help="No relation on name, DOB, or postcode — excluded from match figures.")
 
     if field_rows:
         st.markdown("**Match rate by field**")

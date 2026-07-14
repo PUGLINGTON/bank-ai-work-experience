@@ -757,9 +757,15 @@ def process_file(filepath, refine=True):
 def compare_record(data, truth_path="customer_table.csv"):
     """Audit-stage comparison of one extracted record against the customer table.
 
-    Returns (rows, matched_name) where rows is a list of per-field dicts with
-    keys field/extracted/expected/status. matched_name is None if the person is
-    not found in the customer table.
+    Returns (rows, matched_name, relation):
+      * rows: per-field dicts with keys field/extracted/expected/status.
+      * matched_name: the customer's name if their name matches, else None.
+      * relation: how the record relates to the table —
+          "matched"  — name matched a customer (rows are populated).
+          "possible" — name didn't match, but the DOB or postcode does relate
+                       to a customer (likely a misread of a real customer).
+          "none"     — no name, DOB, or postcode relates to any customer at all
+                       (e.g. someone not in the table). Kept out of accuracy.
     """
     truth_df = pd.read_csv(truth_path)
 
@@ -788,7 +794,14 @@ def compare_record(data, truth_path="customer_table.csv"):
 
     rows = []
     if matched_name is None:
-        return rows, None
+        # Name didn't match. Does anything else relate this record to the table?
+        # If neither the DOB nor the postcode appears for any customer, it has no
+        # relation to the table at all (kept separate from real mismatches).
+        dob_hit = (not is_missing(rec["date_of_birth"])
+                   and (truth_df["date_of_birth"] == rec["date_of_birth"]).any())
+        pc_hit = (not is_missing(rec["postcode"])
+                  and (truth_df["postcode"] == rec["postcode"]).any())
+        return rows, None, ("possible" if (dob_hit or pc_hit) else "none")
 
     truth_row = truth_df[truth_df["name"] == matched_name].iloc[0]
     for field in ["name", "date_of_birth", "address", "postcode", "occupation", "employer"]:
@@ -804,7 +817,7 @@ def compare_record(data, truth_path="customer_table.csv"):
             "expected": expected,
             "status": "match" if extracted == expected else "mismatch",
         })
-    return rows, matched_name
+    return rows, matched_name, "matched"
 
 
 def store():
