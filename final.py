@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 import json
+import re
 import time
 import csv
 from rapidfuzz import fuzz
@@ -421,7 +422,29 @@ def _line_boxes(pre_image):
     ]
 
 
-def locate_line(pre_image, target_text):
+# Stable on-page labels used to anchor a re-read crop. We locate the *label*
+# (which the model rarely misreads) rather than the extracted value, because the
+# value is exactly what we suspect is wrong — matching on it would just re-crop
+# the wrong region.
+FIELD_LABELS = {
+    "name": ["account holder", "account name", "employee name", "customer name",
+             "name", "employee"],
+    "date_of_birth": ["date of birth", "d.o.b", "dob", "born"],
+    "address": ["address"],
+    "occupation": ["occupation", "job title", "position", "role"],
+    "employer": ["employer", "company name", "employer name"],
+}
+
+# Words that mean a "name" re-read actually grabbed an organisation / header.
+NAME_STOPWORDS = {
+    "bank", "council", "trust", "ltd", "limited", "plc", "statement", "payslip",
+    "account", "holder", "branch", "sort", "code", "company", "employer",
+    "group", "services", "retail", "logistics", "digital", "health", "albion",
+    "university", "insurance", "current", "balance", "sample", "document",
+}
+
+
+def locate_line(pre_image, target_text, min_score=70):
     """Return the bounding box of the OCR line best matching target_text (or None)."""
     if not target_text:
         return None
@@ -437,28 +460,63 @@ def locate_line(pre_image, target_text):
         score = fuzz.partial_ratio(target, ln["text"].lower())
         if score > best_score:
             best_score, best = score, ln
-    if best is None or best_score < 40:
+    if best is None or best_score < min_score:
         return None
     return best["box"]
+
+
+def locate_label_region(pre_image, field_name):
+    """Find the field's *label* and return a crop box over the value beside/below it.
+
+    The value on a form usually sits to the right of its label on the same line,
+    or on the line just underneath. Anchoring on the label (stable text) instead
+    of the extracted value avoids re-cropping whatever wrong region the bad value
+    happened to fuzzy-match. Returns a box, or None if the label isn't found.
+    """
+    labels = FIELD_LABELS.get(field_name, [])
+    if not labels:
+        return None
+    try:
+        lines = _line_boxes(pre_image)
+    except pytesseract.TesseractError:
+        return None
+    if not lines:
+        return None
+
+    best, best_score = None, -1
+    for ln in lines:
+        text = ln["text"].lower()
+        for kw in labels:
+            score = fuzz.partial_ratio(kw, text)
+            if score > best_score:
+                best_score, best = score, ln
+    if best is None or best_score < 85:
+        return None
+
+    left, top, right, bottom = best["box"]
+    height = bottom - top
+    # Same line to the right of the label, plus one line below it.
+    return (left, top, pre_image.width, min(pre_image.height, bottom + int(height * 1.4)))
 
 
 def refine_field(image, field_name, current_value):
     """Re-read one flagged field from a zoomed, heavily-preprocessed crop.
 
-    Finds the line the value was read from, crops that tiny region, upscales and
-    sharpens it, then asks the model to re-read just that field. Returns a
-    refined string, or None if the region can't be found / re-read.
+    Anchors the crop on the field's printed label (falling back to the extracted
+    value only on a strong match), blows the region up, and asks the model to
+    read just that value. Returns the refined string, or None if the region
+    can't be found or the model returns nothing usable.
     """
-    if not current_value:
-        return None
     pre = preprocess_for_ocr(image)
-    box = locate_line(pre, current_value)
+    box = locate_label_region(pre, field_name)
+    if box is None:
+        box = locate_line(pre, current_value)
     if box is None:
         return None
 
     left, top, right, bottom = box
-    pad_x = int((right - left) * 0.08) + 10
-    pad_y = int((bottom - top) * 0.5) + 10
+    pad_x = int((right - left) * 0.02) + 8
+    pad_y = int((bottom - top) * 0.15) + 8
     crop = pre.crop((
         max(0, left - pad_x),
         max(0, top - pad_y),
@@ -471,9 +529,11 @@ def refine_field(image, field_name, current_value):
 
     label = field_name.replace("_", " ")
     prompt = (
-        f"This is a zoomed-in crop from a document showing the {label}. "
-        f"Read the {label} exactly as printed and return ONLY that value, "
-        "with no label, quotes, or explanation."
+        f"This is a zoomed-in crop from an identity document. It should contain "
+        f"the {label}, possibly next to a printed label such as '{label}:'. "
+        f"Return ONLY the {label} value exactly as printed — no label, quotes, or "
+        f"explanation. If the {label} is not clearly visible in this crop, reply "
+        f"with exactly NONE."
     )
     try:
         response = get_mistral_client().chat.complete(
@@ -488,9 +548,63 @@ def refine_field(image, field_name, current_value):
             ],
         )
         refined = (response.choices[0].message.content or "").strip()
-        return refined or None
     except Exception:
         return None
+    if not refined or refined.strip().lower() in {"none", "n/a", "na"}:
+        return None
+    return refined
+
+
+def _looks_like_person_name(value):
+    """True if value plausibly is a person's name (not an org / header)."""
+    if not value:
+        return False
+    v = value.strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,39}", v):
+        return False
+    tokens = [t for t in re.split(r"[ \-]", v.lower()) if t]
+    if not (1 <= len(tokens) <= 4):
+        return False
+    return not any(t in NAME_STOPWORDS for t in tokens)
+
+
+def _plausible_dob(value):
+    """Return a normalized YYYY-MM-DD DOB if it's a plausible adult birth date.
+
+    Rejects future/near-future dates (e.g. a statement date) and anything that
+    would make the customer under 18 or over 120 — a re-read that grabs the
+    wrong line usually lands on one of those.
+    """
+    norm = normalize_date(value)
+    if not norm:
+        return None
+    dob = pd.Timestamp(norm)
+    age_years = (pd.Timestamp.now() - dob).days / 365.25
+    return norm if 18 <= age_years <= 120 else None
+
+
+def accept_refinement(field_name, refined, old_value, ocr_text):
+    """Decide whether a re-read may replace the original value.
+
+    Guards against the re-read grabbing the wrong text: the new value must be
+    field-plausible (a name must look like a name, a DOB must be a valid past
+    date) and, for free-text fields, must actually be supported by the OCR text.
+    Returns the value to use, or None to keep the original.
+    """
+    if not refined:
+        return None
+    if refined.strip().lower() == str(old_value or "").strip().lower():
+        return None
+
+    if field_name == "name":
+        return refined if _looks_like_person_name(refined) else None
+    if field_name == "date_of_birth":
+        return _plausible_dob(refined)
+
+    # Free-text fields: only trust a re-read the OCR text also supports.
+    if ocr_text and fuzz.partial_ratio(refined.lower(), ocr_text.lower()) >= 85:
+        return refined
+    return None
 
 
 def process_file(filepath, refine=True):
@@ -516,12 +630,13 @@ def process_file(filepath, refine=True):
                 field = w["field"]
                 old_value = data.get(field)
                 guess = refine_field(image, field, old_value)
-                if guess and guess.strip().lower() != str(old_value).strip().lower():
-                    if field == "date_of_birth":
-                        guess = normalize_date(guess) or guess
-                    print(f"  REFINED {field}: '{old_value}' -> '{guess}'")
-                    refinements.append({"field": field, "old": old_value, "new": guess})
-                    data[field] = guess
+                accepted = accept_refinement(field, guess, old_value, ocr_text)
+                if accepted:
+                    print(f"  REFINED {field}: '{old_value}' -> '{accepted}'")
+                    refinements.append({"field": field, "old": old_value, "new": accepted})
+                    data[field] = accepted
+                elif guess:
+                    print(f"  re-read rejected for {field}: '{guess}' (kept '{old_value}')")
     return data, ocr_text, warnings, refinements
 
 
