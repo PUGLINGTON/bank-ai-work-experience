@@ -7,12 +7,13 @@ import pandas as pd
 import json
 import time
 import csv
+from rapidfuzz import fuzz
 
 from utils import (
     normalize_text,
     normalize_name,
     normalize_date,
-    normalize_address,
+    split_address,
     fuzzy_match_name,
     extract_postcode,
     remove_postcode,
@@ -74,11 +75,12 @@ def comparison():
             if col in truth_df.columns:
                 truth_df[col] = truth_df[col].apply(normalize_text)
 
-        # Normalize addresses: remove commas, pipes, collapse whitespace, strip postcode spaces
-        if "address" in submit_df.columns:
-            submit_df["address"] = submit_df["address"].apply(normalize_address)
-        if "address" in truth_df.columns:
-            truth_df["address"] = truth_df["address"].apply(normalize_address)
+        # Split address into street + postcode so each is compared independently
+        for df in (submit_df, truth_df):
+            if "address" in df.columns:
+                split = df["address"].apply(split_address)
+                df["address"] = split.apply(lambda t: t[0])
+                df["postcode"] = split.apply(lambda t: t[1])
 
         # Clean employer field to strip payslip prefix
         if "employer" in submit_df.columns:
@@ -111,6 +113,7 @@ def comparison():
             "name": 1,
             "date_of_birth": 1,
             "address": 2,
+            "postcode": 2,
             "occupation": 2,
             "employer": 3,
         }
@@ -364,7 +367,11 @@ def wipe_files():
 
 
 def validate_extraction(data, ocr_text, filename):
-    """Self-consistency checks using only the document itself (no customer table)."""
+    """Self-consistency checks using only the document itself (no customer table).
+
+    Returns a list of {"field", "message"} dicts for any field that looks
+    misread, so the caller can re-read those regions.
+    """
     warnings = []
 
     # Check name appears in OCR text
@@ -375,37 +382,149 @@ def validate_extraction(data, ocr_text, filename):
         name_parts = name_lower.split()
         found_parts = sum(1 for part in name_parts if part in ocr_lower)
         if found_parts < len(name_parts) / 2:
-            warnings.append(f"  WARNING: name '{name}' not well-supported by OCR text")
+            warnings.append({"field": "name",
+                             "message": f"name '{name}' not well-supported by OCR text"})
 
     # Check DOB appears in OCR text
     dob = data.get("date_of_birth")
     if dob and ocr_text:
         dob_variants = [dob, dob.replace("-", "/"), dob.replace("-", "")]
         if not any(v in ocr_text for v in dob_variants):
-            warnings.append(f"  WARNING: DOB '{dob}' not found in OCR text — may be misread")
+            warnings.append({"field": "date_of_birth",
+                             "message": f"DOB '{dob}' not found in OCR text — may be misread"})
 
     for w in warnings:
-        print(w)
+        print(f"  WARNING: {w['message']}")
 
     return warnings
 
 
-def process_file(filepath):
+def _line_boxes(pre_image):
+    """OCR the preprocessed image and group words into lines with bounding boxes."""
+    data = pytesseract.image_to_data(
+        pre_image, config="--oem 3 --psm 6", output_type=pytesseract.Output.DICT
+    )
+    lines = {}
+    for i, txt in enumerate(data["text"]):
+        t = txt.strip()
+        if not t:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        e = lines.setdefault(key, {"words": [], "l": [], "t": [], "r": [], "b": []})
+        e["words"].append(t)
+        e["l"].append(data["left"][i])
+        e["t"].append(data["top"][i])
+        e["r"].append(data["left"][i] + data["width"][i])
+        e["b"].append(data["top"][i] + data["height"][i])
+    return [
+        {"text": " ".join(e["words"]),
+         "box": (min(e["l"]), min(e["t"]), max(e["r"]), max(e["b"]))}
+        for e in lines.values()
+    ]
+
+
+def locate_line(pre_image, target_text):
+    """Return the bounding box of the OCR line best matching target_text (or None)."""
+    if not target_text:
+        return None
+    try:
+        lines = _line_boxes(pre_image)
+    except pytesseract.TesseractError:
+        return None
+    if not lines:
+        return None
+    target = str(target_text).lower()
+    best, best_score = None, -1
+    for ln in lines:
+        score = fuzz.partial_ratio(target, ln["text"].lower())
+        if score > best_score:
+            best_score, best = score, ln
+    if best is None or best_score < 40:
+        return None
+    return best["box"]
+
+
+def refine_field(image, field_name, current_value):
+    """Re-read one flagged field from a zoomed, heavily-preprocessed crop.
+
+    Finds the line the value was read from, crops that tiny region, upscales and
+    sharpens it, then asks the model to re-read just that field. Returns a
+    refined string, or None if the region can't be found / re-read.
+    """
+    if not current_value:
+        return None
+    pre = preprocess_for_ocr(image)
+    box = locate_line(pre, current_value)
+    if box is None:
+        return None
+
+    left, top, right, bottom = box
+    pad_x = int((right - left) * 0.08) + 10
+    pad_y = int((bottom - top) * 0.5) + 10
+    crop = pre.crop((
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(pre.width, right + pad_x),
+        min(pre.height, bottom + pad_y),
+    ))
+    # Blow up the small region so the model sees large, crisp glyphs.
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    crop = ImageOps.autocontrast(crop).filter(ImageFilter.SHARPEN)
+
+    label = field_name.replace("_", " ")
+    prompt = (
+        f"This is a zoomed-in crop from a document showing the {label}. "
+        f"Read the {label} exactly as printed and return ONLY that value, "
+        "with no label, quotes, or explanation."
+    )
+    try:
+        response = get_mistral_client().chat.complete(
+            model="pixtral-large-latest",
+            temperature=0,
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": f"data:image/png;base64,{image_to_base64(crop.convert('RGB'))}"},
+                ]}
+            ],
+        )
+        refined = (response.choices[0].message.content or "").strip()
+        return refined or None
+    except Exception:
+        return None
+
+
+def process_file(filepath, refine=True):
     """Rotation-correct, OCR, and extract a single document (document-only, bank-compliant).
 
-    Returns (data, ocr_text, warnings). No customer table is used here.
+    When a field is flagged as possibly misread, re-reads just that region with
+    heavier preprocessing. Returns (data, ocr_text, warnings, refinements).
     """
     filename = os.path.basename(filepath)
     image = correct_rotation(filepath)
     ocr_text = ocr_preread(image)
     data = extract_info(image, ocr_text)
     warnings = []
+    refinements = []
     if data is not None:
         data["filename"] = filename
         if data.get("employer"):
             data["employer"] = clean_employer(data["employer"])
         warnings = validate_extraction(data, ocr_text, filename)
-    return data, ocr_text, warnings
+
+        if refine:
+            for w in warnings:
+                field = w["field"]
+                old_value = data.get(field)
+                guess = refine_field(image, field, old_value)
+                if guess and guess.strip().lower() != str(old_value).strip().lower():
+                    if field == "date_of_birth":
+                        guess = normalize_date(guess) or guess
+                    print(f"  REFINED {field}: '{old_value}' -> '{guess}'")
+                    refinements.append({"field": field, "old": old_value, "new": guess})
+                    data[field] = guess
+    return data, ocr_text, warnings, refinements
 
 
 def compare_record(data, truth_path="customer_table.csv"):
@@ -421,14 +540,18 @@ def compare_record(data, truth_path="customer_table.csv"):
         if col in truth_df.columns:
             truth_df[col] = truth_df[col].apply(normalize_text)
     if "address" in truth_df.columns:
-        truth_df["address"] = truth_df["address"].apply(normalize_address)
+        truth_split = truth_df["address"].apply(split_address)
+        truth_df["address"] = truth_split.apply(lambda t: t[0])
+        truth_df["postcode"] = truth_split.apply(lambda t: t[1])
     truth_df["name"] = truth_df["name"].apply(normalize_name)
     truth_df["date_of_birth"] = truth_df["date_of_birth"].apply(normalize_date)
 
+    rec_street, rec_postcode = split_address(normalize_text(data.get("address")))
     rec = {
         "name": normalize_name(data.get("name")),
         "date_of_birth": normalize_date(data.get("date_of_birth")),
-        "address": normalize_address(normalize_text(data.get("address"))),
+        "address": rec_street,
+        "postcode": rec_postcode,
         "occupation": normalize_text(data.get("occupation")),
         "employer": clean_employer(normalize_text(data.get("employer"))),
     }
@@ -441,7 +564,7 @@ def compare_record(data, truth_path="customer_table.csv"):
         return rows, None
 
     truth_row = truth_df[truth_df["name"] == matched_name].iloc[0]
-    for field in ["name", "date_of_birth", "address", "occupation", "employer"]:
+    for field in ["name", "date_of_birth", "address", "postcode", "occupation", "employer"]:
         extracted = rec.get(field)
         expected = truth_row.get(field)
         if field == "employer" and is_missing(extracted):
@@ -463,20 +586,10 @@ def store():
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
         print(f"\n--- Processing: {filename} ---")
-        image = correct_rotation(filepath)
 
-        # OCR pre-read for cross-validation
-        ocr_text = ocr_preread(image)
-        if ocr_text:
-            print(f"  OCR pre-read: {len(ocr_text)} characters extracted")
-
-        data = extract_info(image, ocr_text)
+        # Document-only extraction with targeted re-read of flagged fields
+        data, ocr_text, warnings, refinements = process_file(filepath)
         if data is not None:
-            data["filename"] = filename
-
-            # Self-consistency validation (no customer table needed)
-            validate_extraction(data, ocr_text, filename)
-
             results.append(data)
             print(json.dumps(data, indent=2))
 

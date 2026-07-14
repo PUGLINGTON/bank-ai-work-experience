@@ -149,6 +149,30 @@ def remove_postcode(address):
     return POSTCODE_PATTERN.sub('', address).rstrip(', ').strip()
 
 
+# Postcode inside an already-normalized (lowercased, space-stripped) address.
+NORMALIZED_POSTCODE_PATTERN = re.compile(r'[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}')
+
+
+def split_address(address):
+    """Normalize an address and split it into (street, postcode).
+
+    Runs normalize_address first (lowercase, drop commas/pipes, strip postcode
+    spaces), then separates the postcode from the rest so the two can be
+    compared independently. Returns (street, postcode); postcode is None when
+    no postcode is present.
+    """
+    if pd.isna(address):
+        return None, None
+    normalized = str(normalize_address(address))
+    match = NORMALIZED_POSTCODE_PATTERN.search(normalized)
+    if not match:
+        return normalized, None
+    postcode = match.group(0)
+    street = (normalized[:match.start()] + normalized[match.end():])
+    street = re.sub(r'\s+', ' ', street).strip()
+    return street, postcode
+
+
 # ── Image / API helpers ───────────────────────────────────────────────────────
 
 def image_to_base64(image):
