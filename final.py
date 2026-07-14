@@ -15,8 +15,6 @@ from utils import (
     normalize_date,
     split_address,
     fuzzy_match_name,
-    extract_postcode,
-    remove_postcode,
     image_to_base64,
     parse_llm_json,
     ensure_csv,
@@ -605,8 +603,10 @@ def store():
     if "employer" in df.columns:
         df["employer"] = df["employer"].apply(clean_employer)
 
-    df['postcode'] = df['address'].apply(extract_postcode)
-    df['address'] = df['address'].apply(remove_postcode)
+    if 'address' in df.columns:
+        split = df['address'].apply(split_address)
+        df['address'] = split.apply(lambda t: t[0])
+        df['postcode'] = split.apply(lambda t: t[1])
     df.to_csv("final_submit.csv", index=False)
 
 

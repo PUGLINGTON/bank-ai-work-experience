@@ -149,27 +149,33 @@ def remove_postcode(address):
     return POSTCODE_PATTERN.sub('', address).rstrip(', ').strip()
 
 
-# Postcode inside an already-normalized (lowercased, space-stripped) address.
-NORMALIZED_POSTCODE_PATTERN = re.compile(r'[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}')
+# Trailing UK-postcode pattern, tolerant to OCR noise: allows an optional
+# internal space and lets the inward characters be a letter *or* a digit (OCR
+# often swaps o/0, i/1, etc.). Anchored to the end of the string so it only
+# ever grabs the postcode, never part of the street.
+TRAILING_POSTCODE_PATTERN = re.compile(
+    r'[a-z]{1,2}\d{1,2}[a-z0-9]?\s?\d[a-z0-9]{2}\s*$'
+)
 
 
 def split_address(address):
     """Normalize an address and split it into (street, postcode).
 
-    Runs normalize_address first (lowercase, drop commas/pipes, strip postcode
-    spaces), then separates the postcode from the rest so the two can be
-    compared independently. Returns (street, postcode); postcode is None when
-    no postcode is present.
+    Runs normalize_address first (lowercase, drop commas/pipes), then peels the
+    trailing postcode off the end so the two can be compared independently. The
+    postcode match is tolerant to OCR noise (an internal space, or a character
+    read as the wrong type) so a slightly-garbled postcode is still separated
+    from the street instead of being glued onto it. Returns (street, postcode);
+    postcode is None when no postcode is present.
     """
     if pd.isna(address):
         return None, None
     normalized = str(normalize_address(address))
-    match = NORMALIZED_POSTCODE_PATTERN.search(normalized)
+    match = TRAILING_POSTCODE_PATTERN.search(normalized)
     if not match:
         return normalized, None
-    postcode = match.group(0)
-    street = (normalized[:match.start()] + normalized[match.end():])
-    street = re.sub(r'\s+', ' ', street).strip()
+    postcode = re.sub(r'\s+', '', match.group(0))
+    street = re.sub(r'\s+', ' ', normalized[:match.start()]).strip()
     return street, postcode
 
 

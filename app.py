@@ -28,7 +28,27 @@ from utils import extract_customer_id, extract_document_type
 
 TRUTH_PATH = "customer_table.csv"
 
-st.set_page_config(page_title="Document Extraction Auditor", layout="wide")
+st.set_page_config(
+    page_title="Document Extraction Auditor",
+    page_icon="🗂️",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2.2rem; max-width: 1400px; }
+      /* Readable, roomier tables */
+      table { font-size: 0.95rem; }
+      thead th { background: #262730; color: #fafafa !important; }
+      /* Tab labels a touch larger */
+      button[data-baseweb="tab"] p { font-size: 1.02rem; font-weight: 600; }
+      /* Wrap long values instead of truncating */
+      td { white-space: normal !important; word-break: break-word; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "issues" not in st.session_state:
     st.session_state.issues = []
@@ -94,7 +114,7 @@ def render_process_tab():
         add_issue(filename, "-", "extraction failed", "No JSON returned by the model")
         return
 
-    left, right = st.columns([1, 2])
+    left, right = st.columns([1, 2], gap="large")
     with left:
         try:
             st.image(path, caption=filename, use_container_width=True)
@@ -102,23 +122,30 @@ def render_process_tab():
             st.caption("(no preview available)")
 
     with right:
-        st.markdown("**Extracted values** (document only)")
-        st.write({
-            "name": data.get("name"),
-            "date_of_birth": data.get("date_of_birth"),
-            "occupation": data.get("occupation"),
-            "employer": data.get("employer"),
-        })
+        st.markdown("#### Extracted values")
+        st.caption("Read from the document + OCR only — no customer data used.")
 
         street, postcode = _split_for_display(data.get("address"))
-        c1, c2 = st.columns(2)
-        c1.metric("Address (street)", street or "—")
-        c2.metric("Postcode", postcode or "—")
+        ext_df = pd.DataFrame(
+            [
+                ("Name", data.get("name")),
+                ("Date of birth", data.get("date_of_birth")),
+                ("Address (street)", street),
+                ("Postcode", postcode),
+                ("Occupation", data.get("occupation")),
+                ("Employer", data.get("employer")),
+            ],
+            columns=["Field", "Value"],
+        )
+        ext_df["Value"] = ext_df["Value"].apply(lambda v: "—" if not v else str(v))
+        st.table(ext_df)
 
         if refinements:
             st.markdown("**Targeted re-reads applied**")
             for r in refinements:
                 st.info(f"{r['field']}: '{r['old']}' → '{r['new']}'")
+
+    st.divider()
 
     # Comparison vs customer table (audit stage)
     st.markdown("### Comparison vs customer table")
@@ -136,15 +163,30 @@ def render_process_tab():
             add_issue(filename, "name", data.get("name", ""), "Not found in customer table")
         else:
             cmp_df = pd.DataFrame(rows)[["field", "extracted", "expected", "status"]]
+            cmp_df = cmp_df.rename(columns={
+                "field": "Field",
+                "extracted": "Extracted",
+                "expected": "Expected",
+                "status": "Status",
+            })
             st.dataframe(
-                cmp_df.style.apply(_highlight_status, axis=1),
+                cmp_df.style.apply(
+                    lambda r: _highlight_status({"status": r["Status"]}), axis=1
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
             mismatches = [r for r in rows if r["status"] == "mismatch"]
             checked = len(rows)
             acc = 100.0 * (checked - len(mismatches)) / checked if checked else 100.0
-            st.success(f"Matched '{matched_name}' — {len(mismatches)} mismatch(es) of {checked} fields ({acc:.0f}% match).")
+            summary = (
+                f"Matched **{matched_name}** — {len(mismatches)} mismatch(es) "
+                f"of {checked} fields ({acc:.0f}% match)."
+            )
+            if mismatches:
+                st.warning(summary)
+            else:
+                st.success(summary)
             for r in mismatches:
                 add_issue(filename, r["field"], r["extracted"], f"expected: {r['expected']}")
 
@@ -162,8 +204,8 @@ def _split_for_display(address):
 
 
 def _highlight_status(row):
-    color = "#ffe0e0" if row["status"] == "mismatch" else "#e2f6e2"
-    return [f"background-color: {color}"] * len(row)
+    bg = "#f8d7da" if row["status"] == "mismatch" else "#d4edda"
+    return [f"background-color: {bg}; color: #1a1a1a; font-weight: 500"] * len(row)
 
 
 def render_issues_tab():
@@ -212,7 +254,12 @@ def _load_from_csvs():
         st.warning("No audit CSVs found yet. Run final.py for a full batch first.")
 
 
-st.title("Document Extraction Auditor")
+st.title("🗂️ Document Extraction Auditor")
+st.caption(
+    "Extract identity fields from a document, then audit them against the "
+    "customer table. Address is split into street and postcode for both display "
+    "and comparison."
+)
 tab_process, tab_issues = st.tabs(["Process Document", "Issues to Review"])
 with tab_process:
     render_process_tab()
