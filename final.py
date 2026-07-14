@@ -622,6 +622,89 @@ def accept_refinement(field_name, refined, old_value, ocr_text):
     return None
 
 
+# Structural UK-postcode shape (spaces already removed). This is a *format*
+# check, not a content guess — inward part is a digit followed by two letters.
+_POSTCODE_SHAPE = re.compile(r'^[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}$')
+
+
+def _postcode_from_text(text):
+    """Pull a UK-postcode-shaped token out of text (spaces removed), or None."""
+    if not text:
+        return None
+    compact = re.sub(r'\s+', '', str(text).lower())
+    match = re.search(r'[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}', compact)
+    return match.group(0) if match else None
+
+
+def refine_postcode(image, address_value):
+    """Re-read the postcode from the address region and return it only if confident.
+
+    Compliant, no guessing: crops the address region, blows it up, then reads it
+    two independent ways — a fresh Tesseract OCR of the crop and the vision model.
+    A value is returned ONLY when both reads agree on the same postcode-shaped
+    string. If they disagree (or either is unreadable) it returns None so the
+    original extraction is kept and the mismatch stays flagged.
+    """
+    if not address_value:
+        return None
+    pre = preprocess_for_ocr(image)
+    _, current_pc = split_address(address_value)
+
+    box = locate_label_region(pre, "address")
+    if box is None and current_pc:
+        box = locate_line(pre, current_pc)
+    if box is None:
+        box = locate_line(pre, address_value)
+    if box is None:
+        return None
+
+    left, top, right, bottom = box
+    pad_x = int((right - left) * 0.02) + 8
+    pad_y = int((bottom - top) * 0.3) + 8
+    crop = pre.crop((
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(pre.width, right + pad_x),
+        min(pre.height, bottom + pad_y),
+    ))
+    crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
+    crop = ImageOps.autocontrast(crop).filter(ImageFilter.SHARPEN)
+
+    # Read 1: fresh OCR of the high-resolution crop. split_address anchors on the
+    # trailing postcode so a street word isn't mistaken for part of the code.
+    try:
+        _, ocr_pc = split_address(pytesseract.image_to_string(crop, config="--oem 3 --psm 6"))
+    except pytesseract.TesseractError:
+        ocr_pc = None
+
+    # Read 2: the vision model, asked only for the postcode.
+    prompt = (
+        "This is a high-resolution crop of a UK postal address. Return ONLY the "
+        "postcode exactly as printed (for example 'AB12 3CD'). If no postcode is "
+        "clearly visible, reply with exactly NONE."
+    )
+    try:
+        response = get_mistral_client().chat.complete(
+            model="pixtral-12b-2409",
+            temperature=0,
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": f"data:image/png;base64,{image_to_base64(crop.convert('RGB'))}"},
+                ]}
+            ],
+        )
+        model_pc = _postcode_from_text(response.choices[0].message.content)
+    except Exception:
+        model_pc = None
+
+    # Confident only when both independent reads agree on a valid-shaped postcode.
+    if model_pc and model_pc == ocr_pc and _POSTCODE_SHAPE.match(model_pc):
+        return model_pc
+    return None
+
+
 def process_file(filepath, refine=True):
     """Rotation-correct, OCR, and extract a single document (document-only, bank-compliant).
 
@@ -658,6 +741,16 @@ def process_file(filepath, refine=True):
                     data[field] = accepted
                 elif guess:
                     print(f"  re-read rejected for {field}: '{guess}' (kept '{old_value}')")
+
+            # Postcodes are dense codes with no context to self-correct, so
+            # confirm them with a confident high-res re-read (two agreeing reads).
+            if data.get("address"):
+                street, old_pc = split_address(data["address"])
+                new_pc = refine_postcode(image, data["address"])
+                if new_pc and new_pc != old_pc:
+                    data["address"] = f"{street} {new_pc}".strip() if street else new_pc
+                    print(f"  REFINED postcode: '{old_pc}' -> '{new_pc}'")
+                    refinements.append({"field": "postcode", "old": old_pc, "new": new_pc})
     return data, ocr_text, warnings, refinements
 
 
