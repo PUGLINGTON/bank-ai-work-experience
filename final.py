@@ -15,6 +15,7 @@ from utils import (
     normalize_name,
     normalize_date,
     split_address,
+    strip_field_prefixes,
     fuzzy_match_name,
     image_to_base64,
     parse_llm_json,
@@ -621,6 +622,10 @@ def process_file(filepath, refine=True):
     refinements = []
     if data is not None:
         data["filename"] = filename
+        # Strip field labels and document-type header words leaked into values.
+        for field in ("name", "date_of_birth", "address", "occupation", "employer"):
+            if data.get(field):
+                data[field] = strip_field_prefixes(data[field], field, filename)
         if data.get("employer"):
             data["employer"] = clean_employer(data["employer"])
         warnings = validate_extraction(data, ocr_text, filename)
@@ -630,6 +635,8 @@ def process_file(filepath, refine=True):
                 field = w["field"]
                 old_value = data.get(field)
                 guess = refine_field(image, field, old_value)
+                if guess:
+                    guess = strip_field_prefixes(guess, field, filename)
                 accepted = accept_refinement(field, guess, old_value, ocr_text)
                 if accepted:
                     print(f"  REFINED {field}: '{old_value}' -> '{accepted}'")

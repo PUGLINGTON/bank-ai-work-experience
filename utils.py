@@ -134,6 +134,78 @@ def fuzzy_match_name(name, choices, threshold=70):
     return None
 
 
+# ── Prefix stripping ────────────────────────────────────────────────────────
+#
+# Documents print a field's value next to a label, and headers/watermarks leak
+# into the extracted value (e.g. the "BILL" on a *utility bill* getting read as
+# part of a name → "Billie Lily Cooper"). We (1) strip the field's own printed
+# label when it is prepended, and (2) strip a leading document-type header word.
+
+# Header keywords implied by the document type (from the filename).
+DOC_TYPE_KEYWORDS = {
+    'Bank Statement': ['bank statement', 'statement', 'bank'],
+    'Payslip': ['payslip', 'pay slip', 'payslip-'],
+    'Utility Bill': ['utility bill', 'utility', 'bill'],
+}
+
+# Label text that can precede a field's value on the page.
+FIELD_LABEL_PREFIXES = {
+    'name': ['account holder', 'account name', 'customer name', 'employee name',
+             'full name', 'name', 'mr', 'mrs', 'ms', 'miss', 'dr', 'prof'],
+    'date_of_birth': ['date of birth', 'd.o.b', 'd o b', 'dob', 'born', 'birth date'],
+    'address': ['billing address', 'home address', 'address'],
+    'occupation': ['job title', 'occupation', 'position', 'role'],
+    'employer': ['employer name', 'company name', 'employer', 'company'],
+}
+
+
+def _strip_leading_phrases(text, phrases):
+    """Remove any leading label phrase (longest first) plus trailing separators."""
+    changed = True
+    while changed:
+        changed = False
+        for phrase in sorted(phrases, key=len, reverse=True):
+            # phrase must be followed by a word boundary / separator, not glued
+            # into a longer word (so "name" won't eat "nathan").
+            pattern = r'^' + re.escape(phrase) + r'\b[\s:\-|]*'
+            new = re.sub(pattern, '', text, flags=re.IGNORECASE)
+            if new != text:
+                text = new
+                changed = True
+                break
+    return text.strip()
+
+
+def strip_field_prefixes(value, field, filename=None):
+    """Remove field labels and document-type header words from an extracted value.
+
+    Strips the field's own printed label (e.g. "Date of Birth: 1984-…" → "1984-…")
+    and, for the name field, a leading header token that fuzzy-matches the
+    document type implied by the filename (e.g. a utility *bill* leaking
+    "Billie" onto the front of the name). Only strips a name header token when a
+    real name still remains afterwards, so genuine names are preserved.
+    """
+    if pd.isna(value) or value == "":
+        return value
+    text = str(value).strip()
+
+    # 1) Strip the field's own label if it was prepended.
+    text = _strip_leading_phrases(text, FIELD_LABEL_PREFIXES.get(field, []))
+
+    # 2) For names, drop a leading header word (bill/payslip/statement/…) that
+    #    the OCR/model glued on, but only if two or more name tokens remain.
+    if field == 'name' and filename is not None:
+        doc_type = extract_document_type(filename)
+        keywords = DOC_TYPE_KEYWORDS.get(doc_type, [])
+        tokens = text.split()
+        if len(tokens) >= 3 and keywords:
+            first = tokens[0].lower().strip(".,")
+            if any(fuzz.ratio(first, kw) >= 80 for kw in keywords):
+                text = " ".join(tokens[1:]).strip()
+
+    return text if text else None
+
+
 # ── Postcode helpers ───────────────────────────────────────────────────────────
 
 def extract_postcode(address):
