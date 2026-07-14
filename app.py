@@ -170,9 +170,7 @@ def render_process_tab():
                 "status": "Status",
             })
             st.dataframe(
-                cmp_df.style.apply(
-                    lambda r: _highlight_status({"status": r["Status"]}), axis=1
-                ),
+                cmp_df.style.apply(_highlight_status, axis=1),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -204,7 +202,8 @@ def _split_for_display(address):
 
 
 def _highlight_status(row):
-    bg = "#f8d7da" if row["status"] == "mismatch" else "#d4edda"
+    status = row.get("Status", row.get("status"))
+    bg = "#f8d7da" if status == "mismatch" else "#d4edda"
     return [f"background-color: {bg}; color: #1a1a1a; font-weight: 500"] * len(row)
 
 
