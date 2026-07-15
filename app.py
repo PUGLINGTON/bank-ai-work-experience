@@ -502,40 +502,64 @@ def render_review_tab():
     approved = st.session_state.approved
     rejected = st.session_state.rejected
 
-    names = [r["filename"] for r in results]
-    choice = st.selectbox("Document to review", names, key="review_choice")
-    result = next(r for r in results if r["filename"] == choice)
+    # Documents that passed fully (status "ok") are added straight to the pack
+    # and are not surfaced for manual review.
+    for r in results:
+        if r["status"] == "ok" and r["filename"] not in rejected:
+            approved.setdefault(r["filename"], r["path"])
 
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.markdown("**Scanned document** — read regions highlighted")
-        try:
-            with st.spinner("Locating read regions…"):
-                img = annotate_read_regions(result["path"])
-            st.image(img, use_container_width=True)
-        except Exception:
+    # Review queue: only documents that need a human look and aren't decided yet.
+    pending = [
+        r for r in results
+        if r["status"] != "ok"
+        and r["filename"] not in approved
+        and r["filename"] not in rejected
+    ]
+
+    auto_ok = sum(1 for r in results if r["status"] == "ok")
+    st.caption(
+        f"{len(pending)} awaiting review · {len(approved)} approved "
+        f"({auto_ok} auto-added as fully passed) · {len(rejected)} rejected"
+    )
+
+    if not pending:
+        st.success(
+            "Nothing left to review. Fully-passed documents were added to the "
+            "pack automatically — download it below."
+        )
+    else:
+        idx = max(0, min(st.session_state.get("review_idx", 0), len(pending) - 1))
+        labels = [f"{r['filename']}  ·  {r['status']}" for r in pending]
+        picked = st.selectbox("Awaiting review", labels, index=idx)
+        idx = labels.index(picked)
+        st.session_state.review_idx = idx
+        result = pending[idx]
+
+        left, right = st.columns(2, gap="large")
+        with left:
+            st.markdown("**Scanned document** — read regions highlighted")
             try:
-                st.image(result["path"], use_container_width=True)
+                with st.spinner("Locating read regions…"):
+                    img = annotate_read_regions(result["path"])
+                st.image(img, use_container_width=True)
             except Exception:
-                st.caption("(no preview available)")
-    with right:
-        st.markdown("**Database info**")
-        _render_db_panel(result)
+                try:
+                    st.image(result["path"], use_container_width=True)
+                except Exception:
+                    st.caption("(no preview available)")
+        with right:
+            st.markdown("**Database info**")
+            _render_db_panel(result)
 
-    b1, b2, b3 = st.columns([1, 1, 4])
-    if b1.button("✅ Approve", key="review_approve"):
-        approved[choice] = result["path"]
-        rejected.pop(choice, None)
-    if b2.button("❌ Reject", key="review_reject"):
-        rejected[choice] = result.get("status", "rejected")
-        approved.pop(choice, None)
-    if b3.button("Clear decision", key="review_clear"):
-        approved.pop(choice, None)
-        rejected.pop(choice, None)
-
-    decision = ("approved" if choice in approved else
-                "rejected" if choice in rejected else "undecided")
-    st.markdown(f"Current decision for **{choice}**: **{decision}**")
+        b1, b2, _ = st.columns([1, 1, 4])
+        if b1.button("✅ Approve → next", key="review_approve"):
+            approved[result["filename"]] = result["path"]
+            rejected.pop(result["filename"], None)
+            st.rerun()
+        if b2.button("❌ Reject → next", key="review_reject"):
+            rejected[result["filename"]] = result.get("status", "rejected")
+            approved.pop(result["filename"], None)
+            st.rerun()
 
     st.divider()
     col_a, col_r = st.columns(2)
