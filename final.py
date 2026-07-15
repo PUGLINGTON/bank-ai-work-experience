@@ -62,6 +62,36 @@ def get_mistral_client():
     return _mistral_client
 
 
+# Running tally of Mistral token usage for the current session.
+_token_usage = {"calls": 0, "prompt": 0, "completion": 0, "total": 0}
+
+
+def reset_token_usage():
+    """Zero the token counters (call before a fresh run/batch)."""
+    for k in _token_usage:
+        _token_usage[k] = 0
+
+
+def record_usage(response):
+    """Accumulate token counts from a Mistral chat.complete response."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    _token_usage["calls"] += 1
+    _token_usage["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+    _token_usage["completion"] += getattr(usage, "completion_tokens", 0) or 0
+    _token_usage["total"] += getattr(usage, "total_tokens", 0) or 0
+
+
+def get_token_usage():
+    """Return a copy of the running token tally plus the average per call."""
+    stats = dict(_token_usage)
+    stats["avg_total_per_call"] = (
+        stats["total"] / stats["calls"] if stats["calls"] else 0
+    )
+    return stats
+
+
 def comparison():
     def compare_csvs(submit_path="submit.csv", truth_path="customer_table.csv"):
         submit_df = pd.read_csv(submit_path)
@@ -368,6 +398,7 @@ def extract_info(image, ocr_text=""):
             ]}
         ],
     )
+    record_usage(response)
 
     return parse_llm_json(response.choices[0].message.content)
 
@@ -562,6 +593,7 @@ def refine_field(image, field_name, current_value):
                 ]}
             ],
         )
+        record_usage(response)
         refined = (response.choices[0].message.content or "").strip()
     except Exception:
         return None
@@ -695,6 +727,7 @@ def refine_postcode(image, address_value):
                 ]}
             ],
         )
+        record_usage(response)
         model_pc = _postcode_from_text(response.choices[0].message.content)
     except Exception:
         model_pc = None

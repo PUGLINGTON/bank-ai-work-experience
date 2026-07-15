@@ -30,7 +30,10 @@ import zipfile
 import pandas as pd
 import streamlit as st
 
-from final import process_file, compare_record, annotate_read_regions
+from final import (
+    process_file, compare_record, annotate_read_regions,
+    correct_rotation, get_token_usage, reset_token_usage,
+)
 from utils import extract_customer_id, extract_document_type, split_address
 
 TRUTH_PATH = "customer_table.csv"
@@ -88,6 +91,37 @@ def _highlight_status(row):
     status = row.get("Status", row.get("status"))
     bg = "#f8d7da" if status == "mismatch" else "#d4edda"
     return [f"background-color: {bg}; color: #1a1a1a; font-weight: 500"] * len(row)
+
+
+@st.cache_data(show_spinner=False)
+def _oriented_image_cached(path, _mtime):
+    return correct_rotation(path)
+
+
+def _oriented_image(path):
+    """Rotation-corrected image for display (cached per file), or None."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    try:
+        return _oriented_image_cached(path, mtime)
+    except Exception:
+        return None
+
+
+def _render_token_usage(prefix=""):
+    """Show Mistral token usage: average per API call and session total."""
+    stats = get_token_usage()
+    if not stats["calls"]:
+        return
+    st.markdown(f"**{prefix}Mistral token usage**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("API calls", stats["calls"])
+    c2.metric("Avg tokens / call", f"{stats['avg_total_per_call']:.0f}")
+    c3.metric("Total tokens", f"{stats['total']:,}")
+    c4.metric("Prompt / completion",
+              f"{stats['prompt']:,} / {stats['completion']:,}")
 
 
 def resolve_input_path(uploaded, typed_path):
@@ -206,10 +240,10 @@ def render_result_detail(result):
 
     left, right = st.columns([1, 2], gap="large")
     with left:
-        try:
-            st.image(result["path"], caption=result["filename"],
-                     use_container_width=True)
-        except Exception:
+        img = _oriented_image(result["path"])
+        if img is not None:
+            st.image(img, caption=result["filename"], use_container_width=True)
+        else:
             st.caption("(no preview available)")
 
     with right:
@@ -285,15 +319,20 @@ def render_process_tab():
         elif not os.path.exists(path):
             st.error(f"File not found: {path}")
         else:
+            reset_token_usage()
             with st.spinner("Rotating, running OCR, extracting, and re-reading flagged fields…"):
                 result = run_one(path)
             st.session_state.results.append(result)
             st.session_state["last_result"] = result
+            st.session_state["last_usage"] = get_token_usage()
 
     last = st.session_state.get("last_result")
     if last is not None:
         render_result_detail(last)
         st.caption("Issues from this document were added to the other tabs.")
+        if st.session_state.get("last_usage", {}).get("calls"):
+            st.divider()
+            _render_token_usage("This run — ")
 
 
 def render_folder_tab():
@@ -313,6 +352,7 @@ def render_folder_tab():
             st.warning("No image files found in that folder.")
             return
 
+        reset_token_usage()
         progress = st.progress(0.0, text="Starting…")
         summary = []
         for i, name in enumerate(files, start=1):
@@ -334,6 +374,9 @@ def render_folder_tab():
         st.success(f"Scanned {len(files)} file(s) — {n_flag} need review "
                    "(see the Flagged Files tab).")
         st.dataframe(df, use_container_width=True, hide_index=True)
+        st.session_state["last_usage"] = get_token_usage()
+        st.divider()
+        _render_token_usage("Scan — ")
 
 
 def render_flagged_tab():
@@ -549,12 +592,12 @@ def render_review_tab():
             try:
                 with st.spinner("Locating read regions…"):
                     img = annotate_read_regions(result["path"])
-                st.image(img, use_container_width=True)
             except Exception:
-                try:
-                    st.image(result["path"], use_container_width=True)
-                except Exception:
-                    st.caption("(no preview available)")
+                img = _oriented_image(result["path"])
+            if img is not None:
+                st.image(img, use_container_width=True)
+            else:
+                st.caption("(no preview available)")
         with right:
             st.markdown("**Database info**")
             _render_db_panel(result)
