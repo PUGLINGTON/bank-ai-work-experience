@@ -825,22 +825,31 @@ st.caption(
     "customer table. Address is split into street and postcode for both display "
     "and comparison."
 )
-(tab_process, tab_folder, tab_flagged, tab_metrics,
- tab_review, tab_tokens, tab_issues) = st.tabs(
-    ["Process Document", "Scan Folder", "Flagged Files",
-     "Accuracy", "Final Review", "Token Usage", "Issues to Review"]
+cat_input, cat_review, cat_analytics = st.tabs(
+    ["📥 Input", "🔍 Review / Audit", "📊 Analytics"]
 )
-with tab_process:
-    render_process_tab()
-with tab_folder:
-    render_folder_tab()
-with tab_flagged:
-    render_flagged_tab()
-with tab_metrics:
-    render_metrics_tab()
-with tab_review:
-    render_review_tab()
-with tab_tokens:
-    render_tokens_tab()
-with tab_issues:
-    render_issues_tab()
+
+with cat_input:
+    tab_process, tab_folder = st.tabs(["Process Document", "Scan Folder"])
+    with tab_process:
+        render_process_tab()
+    with tab_folder:
+        render_folder_tab()
+
+with cat_review:
+    tab_flagged, tab_review, tab_issues = st.tabs(
+        ["Flagged Files", "Final Review", "Issues to Review"]
+    )
+    with tab_flagged:
+        render_flagged_tab()
+    with tab_review:
+        render_review_tab()
+    with tab_issues:
+        render_issues_tab()
+
+with cat_analytics:
+    tab_metrics, tab_tokens = st.tabs(["Accuracy", "Token Usage"])
+    with tab_metrics:
+        render_metrics_tab()
+    with tab_tokens:
+        render_tokens_tab()
