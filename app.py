@@ -27,6 +27,7 @@ import os
 import tempfile
 import zipfile
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -110,15 +111,17 @@ def _oriented_image(path):
         return None
 
 
-def _render_token_usage(prefix=""):
-    """Show Mistral token usage: average per API call and session total."""
-    stats = get_token_usage()
-    if not stats["calls"]:
+def _render_token_usage(stats, prefix=""):
+    """Show Mistral token usage metric cards from a stats dict."""
+    if not stats or not stats.get("calls"):
         return
+    avg = stats.get("avg_total_per_call")
+    if avg is None:
+        avg = stats["total"] / stats["calls"] if stats["calls"] else 0
     st.markdown(f"**{prefix}Mistral token usage**")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("API calls", stats["calls"])
-    c2.metric("Avg tokens / call", f"{stats['avg_total_per_call']:.0f}")
+    c2.metric("Avg tokens / call", f"{avg:.0f}")
     c3.metric("Total tokens", f"{stats['total']:,}")
     c4.metric("Prompt / completion",
               f"{stats['prompt']:,} / {stats['completion']:,}")
@@ -140,6 +143,14 @@ def resolve_input_path(uploaded, typed_path):
 
 
 def run_one(path):
+    """Process one document and attach its Mistral token usage to the result."""
+    reset_token_usage()
+    result = _run_one(path)
+    result["tokens"] = get_token_usage()
+    return result
+
+
+def _run_one(path):
     """Extract + compare a single document and return a structured result dict.
 
     Also appends the resulting issues to the shared 'Issues to Review' list.
@@ -319,20 +330,19 @@ def render_process_tab():
         elif not os.path.exists(path):
             st.error(f"File not found: {path}")
         else:
-            reset_token_usage()
             with st.spinner("Rotating, running OCR, extracting, and re-reading flagged fields…"):
                 result = run_one(path)
             st.session_state.results.append(result)
             st.session_state["last_result"] = result
-            st.session_state["last_usage"] = get_token_usage()
 
     last = st.session_state.get("last_result")
     if last is not None:
         render_result_detail(last)
         st.caption("Issues from this document were added to the other tabs.")
-        if st.session_state.get("last_usage", {}).get("calls"):
+        if last.get("tokens", {}).get("calls"):
             st.divider()
-            _render_token_usage("This run — ")
+            _render_token_usage(last["tokens"], "This document — ")
+            st.caption("Full per-file breakdown and pie chart on the Token Usage tab.")
 
 
 def render_folder_tab():
@@ -352,7 +362,6 @@ def render_folder_tab():
             st.warning("No image files found in that folder.")
             return
 
-        reset_token_usage()
         progress = st.progress(0.0, text="Starting…")
         summary = []
         for i, name in enumerate(files, start=1):
@@ -374,9 +383,7 @@ def render_folder_tab():
         st.success(f"Scanned {len(files)} file(s) — {n_flag} need review "
                    "(see the Flagged Files tab).")
         st.dataframe(df, use_container_width=True, hide_index=True)
-        st.session_state["last_usage"] = get_token_usage()
-        st.divider()
-        _render_token_usage("Scan — ")
+        st.caption("Token usage and per-file pie chart are on the Token Usage tab.")
 
 
 def render_flagged_tab():
@@ -639,6 +646,72 @@ def render_review_tab():
             st.caption("None rejected yet.")
 
 
+def render_tokens_tab():
+    st.subheader("Token usage")
+    st.caption("Mistral tokens used per document (extraction + any targeted "
+               "re-reads), so you can work out cost.")
+
+    results = [r for r in st.session_state.results if r.get("tokens", {}).get("calls")]
+    if not results:
+        st.info("No token usage yet. Process a document or scan a folder with your "
+                "API key set — usage is reported by the Mistral API per call.")
+        return
+
+    rows = []
+    for r in results:
+        t = r["tokens"]
+        rows.append({
+            "filename": r["filename"],
+            "document_type": r["document_type"],
+            "api_calls": t["calls"],
+            "prompt": t["prompt"],
+            "completion": t["completion"],
+            "total": t["total"],
+        })
+    df = pd.DataFrame(rows)
+
+    total_tokens = int(df["total"].sum())
+    total_calls = int(df["api_calls"].sum())
+    avg_per_call = total_tokens / total_calls if total_calls else 0
+    avg_per_file = total_tokens / len(df) if len(df) else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Documents", len(df))
+    c2.metric("API calls", total_calls)
+    c3.metric("Avg tokens / call", f"{avg_per_call:.0f}")
+    c4.metric("Total tokens", f"{total_tokens:,}")
+    st.caption(f"Average tokens per document: {avg_per_file:.0f}. "
+               "Multiply total tokens by your Mistral per-token rate for cost.")
+
+    st.markdown("**Tokens per document**")
+    pie = (
+        alt.Chart(df)
+        .mark_arc(innerRadius=50)
+        .encode(
+            theta=alt.Theta("total:Q", title="Tokens"),
+            color=alt.Color("filename:N", title="Document"),
+            tooltip=[
+                alt.Tooltip("filename:N", title="File"),
+                alt.Tooltip("total:Q", title="Total tokens"),
+                alt.Tooltip("api_calls:Q", title="API calls"),
+                alt.Tooltip("prompt:Q", title="Prompt tokens"),
+                alt.Tooltip("completion:Q", title="Completion tokens"),
+            ],
+        )
+        .properties(height=340)
+    )
+    st.altair_chart(pie, use_container_width=True)
+
+    st.markdown("**Per-document breakdown**")
+    st.dataframe(
+        df.rename(columns={
+            "filename": "File", "document_type": "Type", "api_calls": "API calls",
+            "prompt": "Prompt", "completion": "Completion", "total": "Total",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+
+
 def render_issues_tab():
     st.subheader("Issues to review")
     top = st.columns([1, 1, 4])
@@ -692,9 +765,9 @@ st.caption(
     "and comparison."
 )
 (tab_process, tab_folder, tab_flagged, tab_metrics,
- tab_review, tab_issues) = st.tabs(
+ tab_review, tab_tokens, tab_issues) = st.tabs(
     ["Process Document", "Scan Folder", "Flagged Files",
-     "Accuracy", "Final Review", "Issues to Review"]
+     "Accuracy", "Final Review", "Token Usage", "Issues to Review"]
 )
 with tab_process:
     render_process_tab()
@@ -706,5 +779,7 @@ with tab_metrics:
     render_metrics_tab()
 with tab_review:
     render_review_tab()
+with tab_tokens:
+    render_tokens_tab()
 with tab_issues:
     render_issues_tab()
