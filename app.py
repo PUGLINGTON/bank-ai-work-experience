@@ -22,13 +22,15 @@ extraction, so the extraction stage stays bank-compliant.
 Run with:  streamlit run app.py
 """
 
+import io
 import os
 import tempfile
+import zipfile
 
 import pandas as pd
 import streamlit as st
 
-from final import process_file, compare_record
+from final import process_file, compare_record, annotate_read_regions
 from utils import extract_customer_id, extract_document_type, split_address
 
 TRUTH_PATH = "customer_table.csv"
@@ -57,6 +59,10 @@ if "issues" not in st.session_state:
     st.session_state.issues = []
 if "results" not in st.session_state:
     st.session_state.results = []
+if "approved" not in st.session_state:
+    st.session_state.approved = {}   # filename -> path
+if "rejected" not in st.session_state:
+    st.session_state.rejected = {}   # filename -> reason
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -425,6 +431,139 @@ def render_metrics_tab():
         st.bar_chart(status_df.set_index("status"), height=260)
 
 
+def _render_db_panel(result):
+    """Right-hand panel: what the customer table says vs what we extracted."""
+    data = result.get("data") or {}
+    if result.get("matched_name"):
+        st.success(f"Matched customer: **{result['matched_name']}**")
+        cmp_df = pd.DataFrame(result["rows"])[["field", "extracted", "expected", "status"]]
+        cmp_df = cmp_df.rename(columns={
+            "field": "Field", "extracted": "Extracted",
+            "expected": "Expected", "status": "Status",
+        })
+        st.dataframe(
+            cmp_df.style.apply(_highlight_status, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+        return
+
+    if result.get("relation") == "none":
+        st.error("No relation to the customer table (name, DOB, and postcode "
+                 "all unmatched).")
+    elif result.get("relation") == "possible":
+        st.warning("Name not matched, but DOB/postcode relates to a customer — "
+                   "possible misread.")
+    else:
+        st.info("Not compared against the customer table.")
+
+    street, postcode = _split_for_display(data.get("address"))
+    ext_df = pd.DataFrame(
+        [
+            ("Name", data.get("name")),
+            ("Date of birth", data.get("date_of_birth")),
+            ("Address (street)", street),
+            ("Postcode", postcode),
+            ("Occupation", data.get("occupation")),
+            ("Employer", data.get("employer")),
+        ],
+        columns=["Field", "Extracted value"],
+    )
+    ext_df["Extracted value"] = ext_df["Extracted value"].apply(
+        lambda v: "—" if not v else str(v))
+    st.table(ext_df)
+
+
+def _build_zip(approved, rejected):
+    """Zip up the approved document files plus approved/rejected manifests."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fname, path in approved.items():
+            if path and os.path.exists(path):
+                z.write(path, arcname=os.path.join("approved", fname))
+        z.writestr("approved_documents.txt",
+                   "\n".join(sorted(approved)) or "(none)")
+        z.writestr("rejected_documents.txt",
+                   "\n".join(f"{f}\t{reason}" for f, reason in sorted(rejected.items()))
+                   or "(none)")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_review_tab():
+    st.subheader("Final review")
+    st.caption("Manually approve or reject each document. Approved documents go "
+               "into a downloadable pack; rejected ones are listed separately.")
+
+    results = st.session_state.results
+    if not results:
+        st.info("No results yet. Process a document or scan a folder first.")
+        return
+
+    approved = st.session_state.approved
+    rejected = st.session_state.rejected
+
+    names = [r["filename"] for r in results]
+    choice = st.selectbox("Document to review", names, key="review_choice")
+    result = next(r for r in results if r["filename"] == choice)
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("**Scanned document** — read regions highlighted")
+        try:
+            with st.spinner("Locating read regions…"):
+                img = annotate_read_regions(result["path"])
+            st.image(img, use_container_width=True)
+        except Exception:
+            try:
+                st.image(result["path"], use_container_width=True)
+            except Exception:
+                st.caption("(no preview available)")
+    with right:
+        st.markdown("**Database info**")
+        _render_db_panel(result)
+
+    b1, b2, b3 = st.columns([1, 1, 4])
+    if b1.button("✅ Approve", key="review_approve"):
+        approved[choice] = result["path"]
+        rejected.pop(choice, None)
+    if b2.button("❌ Reject", key="review_reject"):
+        rejected[choice] = result.get("status", "rejected")
+        approved.pop(choice, None)
+    if b3.button("Clear decision", key="review_clear"):
+        approved.pop(choice, None)
+        rejected.pop(choice, None)
+
+    decision = ("approved" if choice in approved else
+                "rejected" if choice in rejected else "undecided")
+    st.markdown(f"Current decision for **{choice}**: **{decision}**")
+
+    st.divider()
+    col_a, col_r = st.columns(2)
+    with col_a:
+        st.markdown(f"**Approved — in the pack ({len(approved)})**")
+        if approved:
+            st.dataframe(pd.DataFrame({"document": sorted(approved)}),
+                         use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download approved pack (.zip)",
+                data=_build_zip(approved, rejected),
+                file_name="approved_documents.zip",
+                mime="application/zip",
+            )
+        else:
+            st.caption("None approved yet.")
+    with col_r:
+        st.markdown(f"**Rejected / not added ({len(rejected)})**")
+        if rejected:
+            st.dataframe(
+                pd.DataFrame([{"document": f, "reason": reason}
+                              for f, reason in sorted(rejected.items())]),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.caption("None rejected yet.")
+
+
 def render_issues_tab():
     st.subheader("Issues to review")
     top = st.columns([1, 1, 4])
@@ -477,9 +616,10 @@ st.caption(
     "customer table. Address is split into street and postcode for both display "
     "and comparison."
 )
-tab_process, tab_folder, tab_flagged, tab_metrics, tab_issues = st.tabs(
+(tab_process, tab_folder, tab_flagged, tab_metrics,
+ tab_review, tab_issues) = st.tabs(
     ["Process Document", "Scan Folder", "Flagged Files",
-     "Accuracy", "Issues to Review"]
+     "Accuracy", "Final Review", "Issues to Review"]
 )
 with tab_process:
     render_process_tab()
@@ -489,5 +629,7 @@ with tab_flagged:
     render_flagged_tab()
 with tab_metrics:
     render_metrics_tab()
+with tab_review:
+    render_review_tab()
 with tab_issues:
     render_issues_tab()

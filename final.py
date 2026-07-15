@@ -1,5 +1,5 @@
 from mistralai import Mistral
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 import pytesseract
 import os
 from dotenv import load_dotenv
@@ -703,6 +703,37 @@ def refine_postcode(image, address_value):
     if model_pc and model_pc == ocr_pc and _POSTCODE_SHAPE.match(model_pc):
         return model_pc
     return None
+
+
+# Colour per field for the review highlight overlay.
+_REGION_COLORS = {
+    "name": (220, 30, 30),
+    "date_of_birth": (30, 120, 220),
+    "address": (30, 160, 60),
+    "occupation": (210, 120, 20),
+    "employer": (150, 40, 200),
+}
+
+
+def annotate_read_regions(filepath):
+    """Return an RGB image of the document with each field's read region boxed.
+
+    Rotation-corrects and preprocesses the document exactly as the extractor
+    does, locates each field's label region (OCR only, no API), and draws a
+    labelled rectangle around it so an auditor can see where each value was read
+    from. Regions that can't be located are simply skipped.
+    """
+    image = correct_rotation(filepath)
+    pre = preprocess_for_ocr(image)
+    annotated = pre.convert("RGB")
+    draw = ImageDraw.Draw(annotated)
+    for field, color in _REGION_COLORS.items():
+        box = locate_label_region(pre, field)
+        if box:
+            draw.rectangle(box, outline=color, width=3)
+            draw.text((box[0] + 4, max(0, box[1] - 12)),
+                      field.replace("_", " "), fill=color)
+    return annotated
 
 
 def process_file(filepath, refine=True):
