@@ -138,6 +138,7 @@ def run_one(path):
 
     result["warnings"] = warnings
     result["refinements"] = refinements
+    clean_match = False  # matched a customer with zero field mismatches
 
     if data is None:
         result["status"] = "error"
@@ -162,7 +163,8 @@ def run_one(path):
             if relation == "none":
                 result["status"] = "unrelated"
                 add_issue(filename, "name", data.get("name", ""),
-                          "No relation to customer table (name, DOB, and postcode all unmatched)")
+                          "Suggested: no relation to the customer table (name, DOB "
+                          "and postcode all unmatched) — flagged for manual review")
             else:
                 result["status"] = "unknown"
                 add_issue(filename, "name", data.get("name", ""),
@@ -172,13 +174,17 @@ def run_one(path):
             result["mismatches"] = mismatches
             if mismatches:
                 result["status"] = "flagged"
+            else:
+                clean_match = True
             for r in mismatches:
                 add_issue(filename, r["field"], r["extracted"],
                           f"expected: {r['expected']}")
 
+    # OCR warnings are informational — they don't hold back a document whose
+    # fields all matched the customer table.
     for w in warnings:
         add_issue(filename, "OCR check", "", w["message"])
-        if result["status"] == "ok":
+        if result["status"] == "ok" and not clean_match:
             result["status"] = "flagged"
 
     return result
@@ -236,8 +242,9 @@ def render_result_detail(result):
         return
     if result["matched_name"] is None:
         if result.get("relation") == "none":
-            st.error("No relation to the customer table — name, DOB, and postcode "
-                     "all match no customer. Logged separately (not counted in matches).")
+            st.warning("Suggested: no relation to the customer table — name, DOB, "
+                       "and postcode all match no customer. Flagged for manual "
+                       "review; you decide whether to approve or reject.")
         else:
             st.warning("Name not found in customer table, but the DOB or postcode "
                        "relates to a customer — possible misread. Logged for review.")
@@ -448,8 +455,9 @@ def _render_db_panel(result):
         return
 
     if result.get("relation") == "none":
-        st.error("No relation to the customer table (name, DOB, and postcode "
-                 "all unmatched).")
+        st.warning("Suggested: no relation to the customer table (name, DOB, and "
+                   "postcode all unmatched). Flagged for manual review — approve "
+                   "or reject below.")
     elif result.get("relation") == "possible":
         st.warning("Name not matched, but DOB/postcode relates to a customer — "
                    "possible misread.")
