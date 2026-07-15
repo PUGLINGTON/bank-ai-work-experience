@@ -683,13 +683,20 @@ def render_tokens_tab():
     st.caption(f"Average tokens per document: {avg_per_file:.0f}. "
                "Multiply total tokens by your Mistral per-token rate for cost.")
 
-    st.markdown("**Tokens per document**")
+    files = df["filename"].tolist()
+    search = st.selectbox("Search / focus a file", ["(all files)"] + files,
+                          key="token_search")
+
+    st.markdown("**Tokens per document** — click a slice to open that document")
+    selector = alt.selection_point(fields=["filename"], name="pt")
     pie = (
         alt.Chart(df)
         .mark_arc(innerRadius=50)
+        .add_params(selector)
         .encode(
             theta=alt.Theta("total:Q", title="Tokens"),
             color=alt.Color("filename:N", title="Document"),
+            opacity=alt.condition(selector, alt.value(1.0), alt.value(0.45)),
             tooltip=[
                 alt.Tooltip("filename:N", title="File"),
                 alt.Tooltip("total:Q", title="Total tokens"),
@@ -700,16 +707,70 @@ def render_tokens_tab():
         )
         .properties(height=340)
     )
-    st.altair_chart(pie, use_container_width=True)
+    event = st.altair_chart(pie, use_container_width=True,
+                            on_select="rerun", key="token_pie")
+
+    # A slice click selects a file; the search box overrides it when used.
+    clicked = None
+    try:
+        pts = (event.get("selection", {}) if isinstance(event, dict)
+               else event.selection).get("pt", [])
+        if pts:
+            clicked = pts[0].get("filename")
+    except Exception:
+        clicked = None
+    focused = None if search == "(all files)" else search
+    focused = focused or clicked
+
+    if focused:
+        _render_focused_document(focused, results)
 
     st.markdown("**Per-document breakdown**")
+    table_df = df if not focused else df[df["filename"] == focused]
     st.dataframe(
-        df.rename(columns={
+        table_df.rename(columns={
             "filename": "File", "document_type": "Type", "api_calls": "API calls",
             "prompt": "Prompt", "completion": "Completion", "total": "Total",
         }),
         use_container_width=True, hide_index=True,
     )
+
+
+def _render_focused_document(filename, results):
+    """Show the picked document with its token usage and extracted values."""
+    r = next((x for x in results if x["filename"] == filename), None)
+    if r is None:
+        return
+    st.markdown(f"### {filename}")
+    left, right = st.columns([1, 1], gap="large")
+    with left:
+        try:
+            img = annotate_read_regions(r["path"])
+        except Exception:
+            img = _oriented_image(r["path"])
+        if img is not None:
+            st.image(img, use_container_width=True)
+        else:
+            st.caption("(no preview available)")
+    with right:
+        _render_token_usage(r["tokens"], "This document — ")
+        data = r.get("data") or {}
+        street, postcode = _split_for_display(data.get("address"))
+        ext_df = pd.DataFrame(
+            [
+                ("Name", data.get("name")),
+                ("Date of birth", data.get("date_of_birth")),
+                ("Address (street)", street),
+                ("Postcode", postcode),
+                ("Occupation", data.get("occupation")),
+                ("Employer", data.get("employer")),
+            ],
+            columns=["Field", "Extracted value"],
+        )
+        ext_df["Extracted value"] = ext_df["Extracted value"].apply(
+            lambda v: "—" if not v else str(v))
+        st.table(ext_df)
+    st.divider()
 
 
 def render_issues_tab():
