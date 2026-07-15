@@ -1,21 +1,22 @@
 from mistralai import Mistral
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 import pytesseract
 import os
 from dotenv import load_dotenv
 import pandas as pd
 import json
+import re
 import time
 import csv
+from rapidfuzz import fuzz
 
 from utils import (
     normalize_text,
     normalize_name,
     normalize_date,
-    normalize_address,
+    split_address,
+    strip_field_prefixes,
     fuzzy_match_name,
-    extract_postcode,
-    remove_postcode,
     image_to_base64,
     parse_llm_json,
     ensure_csv,
@@ -61,6 +62,36 @@ def get_mistral_client():
     return _mistral_client
 
 
+# Running tally of Mistral token usage for the current session.
+_token_usage = {"calls": 0, "prompt": 0, "completion": 0, "total": 0}
+
+
+def reset_token_usage():
+    """Zero the token counters (call before a fresh run/batch)."""
+    for k in _token_usage:
+        _token_usage[k] = 0
+
+
+def record_usage(response):
+    """Accumulate token counts from a Mistral chat.complete response."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    _token_usage["calls"] += 1
+    _token_usage["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+    _token_usage["completion"] += getattr(usage, "completion_tokens", 0) or 0
+    _token_usage["total"] += getattr(usage, "total_tokens", 0) or 0
+
+
+def get_token_usage():
+    """Return a copy of the running token tally plus the average per call."""
+    stats = dict(_token_usage)
+    stats["avg_total_per_call"] = (
+        stats["total"] / stats["calls"] if stats["calls"] else 0
+    )
+    return stats
+
+
 def comparison():
     def compare_csvs(submit_path="submit.csv", truth_path="customer_table.csv"):
         submit_df = pd.read_csv(submit_path)
@@ -74,11 +105,12 @@ def comparison():
             if col in truth_df.columns:
                 truth_df[col] = truth_df[col].apply(normalize_text)
 
-        # Normalize addresses: remove commas, pipes, collapse whitespace, strip postcode spaces
-        if "address" in submit_df.columns:
-            submit_df["address"] = submit_df["address"].apply(normalize_address)
-        if "address" in truth_df.columns:
-            truth_df["address"] = truth_df["address"].apply(normalize_address)
+        # Split address into street + postcode so each is compared independently
+        for df in (submit_df, truth_df):
+            if "address" in df.columns:
+                split = df["address"].apply(split_address)
+                df["address"] = split.apply(lambda t: t[0])
+                df["postcode"] = split.apply(lambda t: t[1])
 
         # Clean employer field to strip payslip prefix
         if "employer" in submit_df.columns:
@@ -111,6 +143,7 @@ def comparison():
             "name": 1,
             "date_of_birth": 1,
             "address": 2,
+            "postcode": 2,
             "occupation": 2,
             "employer": 3,
         }
@@ -322,27 +355,41 @@ def extract_info(image, ocr_text=""):
 
     # Build prompt with OCR context for cross-validation
     prompt = (
-        "Extract the following fields from this document image and return ONLY valid JSON, "
-        "no markdown formatting, no explanation: "
-        "name, address, date_of_birth(typically in front of DoB in the format of YYYY-MM-DD, present in all documents), "
-        "occupation(often seen with job in front, DO NOT include the word 'Job'), "
-        "employer(for bank statements and utility bills do not include employer). "
-        "Read names and addresses carefully and exactly as written. "
-        "Text with no meaning associated with the fields specified should be ignored. "
-        "Within the employer field, payslip is present often. DO NOT keep this in the employer field. "
-        "Set any missing fields to null."
+        "You are extracting identity details from a scanned UK bank statement, "
+        "payslip, or utility bill. Return ONLY a valid JSON object (no markdown "
+        "fences, no commentary) with exactly these keys:\n"
+        '  "name", "address", "date_of_birth", "occupation", "employer".\n\n'
+        "Rules for each field:\n"
+        "- name: the person the document belongs to (the account holder / "
+        "employee / customer). NOT the bank, company, council, or document "
+        "title. Copy it exactly as printed, including spelling.\n"
+        "- address: the person's full postal address, including the postcode, "
+        "as one string.\n"
+        "- date_of_birth: the person's date of birth in YYYY-MM-DD format. It is "
+        "usually labelled 'DOB' or 'Date of Birth'. Do NOT use the statement "
+        "date, issue date, or any other date on the page.\n"
+        "- occupation: the person's job title. Return only the job title itself "
+        "(e.g. 'Chef'), never the label word 'Job' or 'Occupation'.\n"
+        "- employer: the employing organisation. This exists ONLY on payslips; "
+        "for bank statements and utility bills set it to null. Never put the "
+        "word 'Payslip' here.\n\n"
+        "General rules:\n"
+        "- Return the VALUE only, never the printed field label next to it.\n"
+        "- Ignore headers, logos, watermarks, and marketing text.\n"
+        "- If a field is not present, set it to null. Do not guess.\n"
     )
 
     if ocr_text:
         prompt += (
-            "\n\nFor cross-reference, here is the raw OCR text extracted from this document. "
-            "Use it to double-check your reading of names, dates, and addresses — "
-            "if the image is unclear, prefer the OCR text for spelling:\n\n"
+            "\nBelow is raw OCR text from the same document. Use it to confirm "
+            "the spelling of names, dates, and addresses; when the image is "
+            "unclear, prefer the OCR spelling. The OCR text may contain extra "
+            "noise — only use it to cross-check the fields above:\n\n"
             f"{ocr_text[:3000]}"
         )
 
     response = get_mistral_client().chat.complete(
-        model="pixtral-large-latest",
+        model="pixtral-12b-2409",
         temperature=0,
         messages=[
             {"role": "user", "content": [
@@ -351,6 +398,7 @@ def extract_info(image, ocr_text=""):
             ]}
         ],
     )
+    record_usage(response)
 
     return parse_llm_json(response.choices[0].message.content)
 
@@ -364,7 +412,11 @@ def wipe_files():
 
 
 def validate_extraction(data, ocr_text, filename):
-    """Self-consistency checks using only the document itself (no customer table)."""
+    """Self-consistency checks using only the document itself (no customer table).
+
+    Returns a list of {"field", "message"} dicts for any field that looks
+    misread, so the caller can re-read those regions.
+    """
     warnings = []
 
     # Check name appears in OCR text
@@ -375,45 +427,409 @@ def validate_extraction(data, ocr_text, filename):
         name_parts = name_lower.split()
         found_parts = sum(1 for part in name_parts if part in ocr_lower)
         if found_parts < len(name_parts) / 2:
-            warnings.append(f"  WARNING: name '{name}' not well-supported by OCR text")
+            warnings.append({"field": "name",
+                             "message": f"name '{name}' not well-supported by OCR text"})
 
     # Check DOB appears in OCR text
     dob = data.get("date_of_birth")
     if dob and ocr_text:
         dob_variants = [dob, dob.replace("-", "/"), dob.replace("-", "")]
         if not any(v in ocr_text for v in dob_variants):
-            warnings.append(f"  WARNING: DOB '{dob}' not found in OCR text — may be misread")
+            warnings.append({"field": "date_of_birth",
+                             "message": f"DOB '{dob}' not found in OCR text — may be misread"})
 
     for w in warnings:
-        print(w)
+        print(f"  WARNING: {w['message']}")
 
     return warnings
 
 
-def process_file(filepath):
+def _line_boxes(pre_image):
+    """OCR the preprocessed image and group words into lines with bounding boxes."""
+    data = pytesseract.image_to_data(
+        pre_image, config="--oem 3 --psm 6", output_type=pytesseract.Output.DICT
+    )
+    lines = {}
+    for i, txt in enumerate(data["text"]):
+        t = txt.strip()
+        if not t:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        e = lines.setdefault(key, {"words": [], "l": [], "t": [], "r": [], "b": []})
+        e["words"].append(t)
+        e["l"].append(data["left"][i])
+        e["t"].append(data["top"][i])
+        e["r"].append(data["left"][i] + data["width"][i])
+        e["b"].append(data["top"][i] + data["height"][i])
+    return [
+        {"text": " ".join(e["words"]),
+         "box": (min(e["l"]), min(e["t"]), max(e["r"]), max(e["b"]))}
+        for e in lines.values()
+    ]
+
+
+# Stable on-page labels used to anchor a re-read crop. We locate the *label*
+# (which the model rarely misreads) rather than the extracted value, because the
+# value is exactly what we suspect is wrong — matching on it would just re-crop
+# the wrong region.
+FIELD_LABELS = {
+    "name": ["account holder", "account name", "employee name", "customer name",
+             "name", "employee"],
+    "date_of_birth": ["date of birth", "d.o.b", "dob", "born"],
+    "address": ["address"],
+    "occupation": ["occupation", "job title", "position", "role"],
+    "employer": ["employer", "company name", "employer name"],
+}
+
+# Words that mean a "name" re-read actually grabbed an organisation / header.
+NAME_STOPWORDS = {
+    "bank", "council", "trust", "ltd", "limited", "plc", "statement", "payslip",
+    "account", "holder", "branch", "sort", "code", "company", "employer",
+    "group", "services", "retail", "logistics", "digital", "health", "albion",
+    "university", "insurance", "current", "balance", "sample", "document",
+}
+
+
+def locate_line(pre_image, target_text, min_score=70):
+    """Return the bounding box of the OCR line best matching target_text (or None)."""
+    if not target_text:
+        return None
+    try:
+        lines = _line_boxes(pre_image)
+    except pytesseract.TesseractError:
+        return None
+    if not lines:
+        return None
+    target = str(target_text).lower()
+    best, best_score = None, -1
+    for ln in lines:
+        score = fuzz.partial_ratio(target, ln["text"].lower())
+        if score > best_score:
+            best_score, best = score, ln
+    if best is None or best_score < min_score:
+        return None
+    return best["box"]
+
+
+def locate_label_region(pre_image, field_name):
+    """Find the field's *label* and return a crop box over the value beside/below it.
+
+    The value on a form usually sits to the right of its label on the same line,
+    or on the line just underneath. Anchoring on the label (stable text) instead
+    of the extracted value avoids re-cropping whatever wrong region the bad value
+    happened to fuzzy-match. Returns a box, or None if the label isn't found.
+    """
+    labels = FIELD_LABELS.get(field_name, [])
+    if not labels:
+        return None
+    try:
+        lines = _line_boxes(pre_image)
+    except pytesseract.TesseractError:
+        return None
+    if not lines:
+        return None
+
+    best, best_score = None, -1
+    for ln in lines:
+        text = ln["text"].lower()
+        for kw in labels:
+            score = fuzz.partial_ratio(kw, text)
+            if score > best_score:
+                best_score, best = score, ln
+    if best is None or best_score < 85:
+        return None
+
+    left, top, right, bottom = best["box"]
+    height = bottom - top
+    # Same line to the right of the label, plus one line below it.
+    return (left, top, pre_image.width, min(pre_image.height, bottom + int(height * 1.4)))
+
+
+def refine_field(image, field_name, current_value):
+    """Re-read one flagged field from a zoomed, heavily-preprocessed crop.
+
+    Anchors the crop on the field's printed label (falling back to the extracted
+    value only on a strong match), blows the region up, and asks the model to
+    read just that value. Returns the refined string, or None if the region
+    can't be found or the model returns nothing usable.
+    """
+    pre = preprocess_for_ocr(image)
+    box = locate_label_region(pre, field_name)
+    if box is None:
+        box = locate_line(pre, current_value)
+    if box is None:
+        return None
+
+    left, top, right, bottom = box
+    pad_x = int((right - left) * 0.02) + 8
+    pad_y = int((bottom - top) * 0.15) + 8
+    crop = pre.crop((
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(pre.width, right + pad_x),
+        min(pre.height, bottom + pad_y),
+    ))
+    # Blow up the small region so the model sees large, crisp glyphs.
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    crop = ImageOps.autocontrast(crop).filter(ImageFilter.SHARPEN)
+
+    label = field_name.replace("_", " ")
+    prompt = (
+        f"This is a zoomed-in crop from an identity document. It should contain "
+        f"the {label}, possibly next to a printed label such as '{label}:'. "
+        f"Return ONLY the {label} value exactly as printed — no label, quotes, or "
+        f"explanation. If the {label} is not clearly visible in this crop, reply "
+        f"with exactly NONE."
+    )
+    try:
+        response = get_mistral_client().chat.complete(
+            model="pixtral-12b-2409",
+            temperature=0,
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": f"data:image/png;base64,{image_to_base64(crop.convert('RGB'))}"},
+                ]}
+            ],
+        )
+        record_usage(response)
+        refined = (response.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+    if not refined or refined.strip().lower() in {"none", "n/a", "na"}:
+        return None
+    return refined
+
+
+def _looks_like_person_name(value):
+    """True if value plausibly is a person's name (not an org / header)."""
+    if not value:
+        return False
+    v = value.strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,39}", v):
+        return False
+    tokens = [t for t in re.split(r"[ \-]", v.lower()) if t]
+    if not (1 <= len(tokens) <= 4):
+        return False
+    return not any(t in NAME_STOPWORDS for t in tokens)
+
+
+def _plausible_dob(value):
+    """Return a normalized YYYY-MM-DD DOB if it's a plausible adult birth date.
+
+    Rejects future/near-future dates (e.g. a statement date) and anything that
+    would make the customer under 18 or over 120 — a re-read that grabs the
+    wrong line usually lands on one of those.
+    """
+    norm = normalize_date(value)
+    if not norm:
+        return None
+    dob = pd.Timestamp(norm)
+    age_years = (pd.Timestamp.now() - dob).days / 365.25
+    return norm if 18 <= age_years <= 120 else None
+
+
+def accept_refinement(field_name, refined, old_value, ocr_text):
+    """Decide whether a re-read may replace the original value.
+
+    Guards against the re-read grabbing the wrong text: the new value must be
+    field-plausible (a name must look like a name, a DOB must be a valid past
+    date) and, for free-text fields, must actually be supported by the OCR text.
+    Returns the value to use, or None to keep the original.
+    """
+    if not refined:
+        return None
+    if refined.strip().lower() == str(old_value or "").strip().lower():
+        return None
+
+    if field_name == "name":
+        return refined if _looks_like_person_name(refined) else None
+    if field_name == "date_of_birth":
+        return _plausible_dob(refined)
+
+    # Free-text fields: only trust a re-read the OCR text also supports.
+    if ocr_text and fuzz.partial_ratio(refined.lower(), ocr_text.lower()) >= 85:
+        return refined
+    return None
+
+
+# Structural UK-postcode shape (spaces already removed). This is a *format*
+# check, not a content guess — inward part is a digit followed by two letters.
+_POSTCODE_SHAPE = re.compile(r'^[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}$')
+
+
+def _postcode_from_text(text):
+    """Pull a UK-postcode-shaped token out of text (spaces removed), or None."""
+    if not text:
+        return None
+    compact = re.sub(r'\s+', '', str(text).lower())
+    match = re.search(r'[a-z]{1,2}\d{1,2}[a-z]?\d[a-z]{2}', compact)
+    return match.group(0) if match else None
+
+
+def refine_postcode(image, address_value):
+    """Re-read the postcode from the address region and return it only if confident.
+
+    Compliant, no guessing: crops the address region, blows it up, then reads it
+    two independent ways — a fresh Tesseract OCR of the crop and the vision model.
+    A value is returned ONLY when both reads agree on the same postcode-shaped
+    string. If they disagree (or either is unreadable) it returns None so the
+    original extraction is kept and the mismatch stays flagged.
+    """
+    if not address_value:
+        return None
+    pre = preprocess_for_ocr(image)
+    _, current_pc = split_address(address_value)
+
+    box = locate_label_region(pre, "address")
+    if box is None and current_pc:
+        box = locate_line(pre, current_pc)
+    if box is None:
+        box = locate_line(pre, address_value)
+    if box is None:
+        return None
+
+    left, top, right, bottom = box
+    pad_x = int((right - left) * 0.02) + 8
+    pad_y = int((bottom - top) * 0.3) + 8
+    crop = pre.crop((
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(pre.width, right + pad_x),
+        min(pre.height, bottom + pad_y),
+    ))
+    crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
+    crop = ImageOps.autocontrast(crop).filter(ImageFilter.SHARPEN)
+
+    # Read 1: fresh OCR of the high-resolution crop. split_address anchors on the
+    # trailing postcode so a street word isn't mistaken for part of the code.
+    try:
+        _, ocr_pc = split_address(pytesseract.image_to_string(crop, config="--oem 3 --psm 6"))
+    except pytesseract.TesseractError:
+        ocr_pc = None
+
+    # Read 2: the vision model, asked only for the postcode.
+    prompt = (
+        "This is a high-resolution crop of a UK postal address. Return ONLY the "
+        "postcode exactly as printed (for example 'AB12 3CD'). If no postcode is "
+        "clearly visible, reply with exactly NONE."
+    )
+    try:
+        response = get_mistral_client().chat.complete(
+            model="pixtral-12b-2409",
+            temperature=0,
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": f"data:image/png;base64,{image_to_base64(crop.convert('RGB'))}"},
+                ]}
+            ],
+        )
+        record_usage(response)
+        model_pc = _postcode_from_text(response.choices[0].message.content)
+    except Exception:
+        model_pc = None
+
+    # Confident only when both independent reads agree on a valid-shaped postcode.
+    if model_pc and model_pc == ocr_pc and _POSTCODE_SHAPE.match(model_pc):
+        return model_pc
+    return None
+
+
+# Colour per field for the review highlight overlay.
+_REGION_COLORS = {
+    "name": (220, 30, 30),
+    "date_of_birth": (30, 120, 220),
+    "address": (30, 160, 60),
+    "occupation": (210, 120, 20),
+    "employer": (150, 40, 200),
+}
+
+
+def annotate_read_regions(filepath):
+    """Return an RGB image of the document with each field's read region boxed.
+
+    Rotation-corrects and preprocesses the document exactly as the extractor
+    does, locates each field's label region (OCR only, no API), and draws a
+    labelled rectangle around it so an auditor can see where each value was read
+    from. Regions that can't be located are simply skipped.
+    """
+    image = correct_rotation(filepath)
+    pre = preprocess_for_ocr(image)
+    annotated = pre.convert("RGB")
+    draw = ImageDraw.Draw(annotated)
+    for field, color in _REGION_COLORS.items():
+        box = locate_label_region(pre, field)
+        if box:
+            draw.rectangle(box, outline=color, width=3)
+            draw.text((box[0] + 4, max(0, box[1] - 12)),
+                      field.replace("_", " "), fill=color)
+    return annotated
+
+
+def process_file(filepath, refine=True):
     """Rotation-correct, OCR, and extract a single document (document-only, bank-compliant).
 
-    Returns (data, ocr_text, warnings). No customer table is used here.
+    When a field is flagged as possibly misread, re-reads just that region with
+    heavier preprocessing. Returns (data, ocr_text, warnings, refinements).
     """
     filename = os.path.basename(filepath)
     image = correct_rotation(filepath)
     ocr_text = ocr_preread(image)
     data = extract_info(image, ocr_text)
     warnings = []
+    refinements = []
     if data is not None:
         data["filename"] = filename
+        # Strip field labels and document-type header words leaked into values.
+        for field in ("name", "date_of_birth", "address", "occupation", "employer"):
+            if data.get(field):
+                data[field] = strip_field_prefixes(data[field], field, filename)
         if data.get("employer"):
             data["employer"] = clean_employer(data["employer"])
         warnings = validate_extraction(data, ocr_text, filename)
-    return data, ocr_text, warnings
+
+        if refine:
+            for w in warnings:
+                field = w["field"]
+                old_value = data.get(field)
+                guess = refine_field(image, field, old_value)
+                if guess:
+                    guess = strip_field_prefixes(guess, field, filename)
+                accepted = accept_refinement(field, guess, old_value, ocr_text)
+                if accepted:
+                    print(f"  REFINED {field}: '{old_value}' -> '{accepted}'")
+                    refinements.append({"field": field, "old": old_value, "new": accepted})
+                    data[field] = accepted
+                elif guess:
+                    print(f"  re-read rejected for {field}: '{guess}' (kept '{old_value}')")
+
+            # Postcodes are dense codes with no context to self-correct, so
+            # confirm them with a confident high-res re-read (two agreeing reads).
+            if data.get("address"):
+                street, old_pc = split_address(data["address"])
+                new_pc = refine_postcode(image, data["address"])
+                if new_pc and new_pc != old_pc:
+                    data["address"] = f"{street} {new_pc}".strip() if street else new_pc
+                    print(f"  REFINED postcode: '{old_pc}' -> '{new_pc}'")
+                    refinements.append({"field": "postcode", "old": old_pc, "new": new_pc})
+    return data, ocr_text, warnings, refinements
 
 
 def compare_record(data, truth_path="customer_table.csv"):
     """Audit-stage comparison of one extracted record against the customer table.
 
-    Returns (rows, matched_name) where rows is a list of per-field dicts with
-    keys field/extracted/expected/status. matched_name is None if the person is
-    not found in the customer table.
+    Returns (rows, matched_name, relation):
+      * rows: per-field dicts with keys field/extracted/expected/status.
+      * matched_name: the customer's name if their name matches, else None.
+      * relation: how the record relates to the table —
+          "matched"  — name matched a customer (rows are populated).
+          "possible" — name didn't match, but the DOB or postcode does relate
+                       to a customer (likely a misread of a real customer).
+          "none"     — no name, DOB, or postcode relates to any customer at all
+                       (e.g. someone not in the table). Kept out of accuracy.
     """
     truth_df = pd.read_csv(truth_path)
 
@@ -421,14 +837,18 @@ def compare_record(data, truth_path="customer_table.csv"):
         if col in truth_df.columns:
             truth_df[col] = truth_df[col].apply(normalize_text)
     if "address" in truth_df.columns:
-        truth_df["address"] = truth_df["address"].apply(normalize_address)
+        truth_split = truth_df["address"].apply(split_address)
+        truth_df["address"] = truth_split.apply(lambda t: t[0])
+        truth_df["postcode"] = truth_split.apply(lambda t: t[1])
     truth_df["name"] = truth_df["name"].apply(normalize_name)
     truth_df["date_of_birth"] = truth_df["date_of_birth"].apply(normalize_date)
 
+    rec_street, rec_postcode = split_address(normalize_text(data.get("address")))
     rec = {
         "name": normalize_name(data.get("name")),
         "date_of_birth": normalize_date(data.get("date_of_birth")),
-        "address": normalize_address(normalize_text(data.get("address"))),
+        "address": rec_street,
+        "postcode": rec_postcode,
         "occupation": normalize_text(data.get("occupation")),
         "employer": clean_employer(normalize_text(data.get("employer"))),
     }
@@ -438,10 +858,17 @@ def compare_record(data, truth_path="customer_table.csv"):
 
     rows = []
     if matched_name is None:
-        return rows, None
+        # Name didn't match. Does anything else relate this record to the table?
+        # If neither the DOB nor the postcode appears for any customer, it has no
+        # relation to the table at all (kept separate from real mismatches).
+        dob_hit = (not is_missing(rec["date_of_birth"])
+                   and (truth_df["date_of_birth"] == rec["date_of_birth"]).any())
+        pc_hit = (not is_missing(rec["postcode"])
+                  and (truth_df["postcode"] == rec["postcode"]).any())
+        return rows, None, ("possible" if (dob_hit or pc_hit) else "none")
 
     truth_row = truth_df[truth_df["name"] == matched_name].iloc[0]
-    for field in ["name", "date_of_birth", "address", "occupation", "employer"]:
+    for field in ["name", "date_of_birth", "address", "postcode", "occupation", "employer"]:
         extracted = rec.get(field)
         expected = truth_row.get(field)
         if field == "employer" and is_missing(extracted):
@@ -454,7 +881,7 @@ def compare_record(data, truth_path="customer_table.csv"):
             "expected": expected,
             "status": "match" if extracted == expected else "mismatch",
         })
-    return rows, matched_name
+    return rows, matched_name, "matched"
 
 
 def store():
@@ -463,20 +890,10 @@ def store():
     for filename in files:
         filepath = os.path.join(DATA_FOLDER, filename)
         print(f"\n--- Processing: {filename} ---")
-        image = correct_rotation(filepath)
 
-        # OCR pre-read for cross-validation
-        ocr_text = ocr_preread(image)
-        if ocr_text:
-            print(f"  OCR pre-read: {len(ocr_text)} characters extracted")
-
-        data = extract_info(image, ocr_text)
+        # Document-only extraction with targeted re-read of flagged fields
+        data, ocr_text, warnings, refinements = process_file(filepath)
         if data is not None:
-            data["filename"] = filename
-
-            # Self-consistency validation (no customer table needed)
-            validate_extraction(data, ocr_text, filename)
-
             results.append(data)
             print(json.dumps(data, indent=2))
 
@@ -492,8 +909,10 @@ def store():
     if "employer" in df.columns:
         df["employer"] = df["employer"].apply(clean_employer)
 
-    df['postcode'] = df['address'].apply(extract_postcode)
-    df['address'] = df['address'].apply(remove_postcode)
+    if 'address' in df.columns:
+        split = df['address'].apply(split_address)
+        df['address'] = split.apply(lambda t: t[0])
+        df['postcode'] = split.apply(lambda t: t[1])
     df.to_csv("final_submit.csv", index=False)
 
 
